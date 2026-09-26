@@ -9,6 +9,7 @@
 #include "airoha-xpon-private.h"
 #include "airoha-xpon-omci.h"
 #include "airoha-xpon-xgpon.h"
+#include "airoha-xpon-epon.h"
 
 static void airoha_xpon_xgpon_release_mac_interfaces(struct airoha_xpon *xpon)
 {
@@ -240,6 +241,23 @@ irqreturn_t airoha_xpon_xgpon_phy_irq(struct airoha_xpon *xpon)
 	return IRQ_HANDLED;
 }
 
+void airoha_xpon_xgpon_drain_ploamd_locked(struct airoha_xpon *xpon)
+{
+	unsigned int count;
+
+	lockdep_assert_held(&xpon->state_lock);
+	if (xpon->stopping || !xpon->active_mode_valid ||
+	    !xpon->mac_initialized ||
+	    airoha_xpon_mode_is_epon(xpon->active_mode))
+		return;
+
+	count = airoha_xpon_drain_ploamd(xpon);
+	if (count == AIROHA_XGPON_PLOAMD_MAX_DRAIN)
+		dev_warn_ratelimited(
+			xpon->dev,
+			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
+}
+
 irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 {
 	u32 enabled, events, status;
@@ -311,11 +329,21 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 		}
 	}
 
-	if ((events & AIROHA_XGPON_INT_PLOAMD_RECV) &&
-	    airoha_xpon_drain_ploamd(xpon) == AIROHA_XGPON_PLOAMD_MAX_DRAIN)
-		dev_warn_ratelimited(
-			xpon->dev,
-			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
+	if (events & AIROHA_XGPON_INT_PLOAMD_RECV) {
+		/*
+		 * PLOAMd changes ONU, crypto, and data-path state.  Prefer the
+		 * threaded-IRQ fast path, but never block on state_lock: lifecycle
+		 * recovery holds that lock while synchronizing this IRQ.  In that
+		 * case link_work drains the hardware FIFO under the normal
+		 * state_lock -> ploam_lock ordering.
+		 */
+		if (mutex_trylock(&xpon->state_lock)) {
+			airoha_xpon_xgpon_drain_ploamd_locked(xpon);
+			mutex_unlock(&xpon->state_lock);
+		} else {
+			mod_delayed_work(system_wq, &xpon->link_work, 0);
+		}
+	}
 	if (atomic_read(&xpon->mac_restart_pending) ||
 	    atomic_read(&xpon->data_path_retry_pending))
 		mod_delayed_work(system_wq, &xpon->link_work, 0);
@@ -404,6 +432,9 @@ airoha_xpon_xgpon_reset_and_enable_digital_rx(struct airoha_xpon *xpon)
 
 static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 {
+	/* Called by link_work with state_lock held. */
+	lockdep_assert_held(&xpon->state_lock);
+
 	if (READ_ONCE(xpon->stopping))
 		return -ESHUTDOWN;
 

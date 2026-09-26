@@ -380,6 +380,7 @@ int airoha_xpon_replace_data_paths(
 int airoha_xpon_clear_data_path(struct airoha_xpon *xpon);
 void airoha_xpon_retry_data_paths(struct airoha_xpon *xpon);
 void airoha_xpon_clear_tconts(struct airoha_xpon *xpon);
+/* Caller holds state_lock; this function acquires ploam_lock. */
 unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon);
 
 int airoha_xpon_crypto_init(struct airoha_xpon *xpon);

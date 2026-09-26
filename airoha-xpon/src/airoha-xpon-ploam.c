@@ -1059,7 +1059,8 @@ unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon)
 {
 	unsigned int count;
 
-	/* T-CONT/GEM share a command port with manual data-path updates. */
+	/* State changes and T-CONT/GEM commands follow state_lock -> ploam_lock. */
+	lockdep_assert_held(&xpon->state_lock);
 	mutex_lock(&xpon->ploam_lock);
 	for (count = 0; count < AIROHA_XGPON_PLOAMD_MAX_DRAIN; count++) {
 		u8 message[AIROHA_XGPON_PLOAMD_BYTES];

@@ -422,6 +422,9 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	mutex_lock(&xpon->state_lock);
 	if (xpon->stopping)
 		goto out_no_requeue;
+	/* Drain PLOAMd deferred by the threaded IRQ before lifecycle changes. */
+	if (!airoha_xpon_mode_is_epon(xpon->active_mode))
+		airoha_xpon_xgpon_drain_ploamd_locked(xpon);
 
 	if (ret) {
 		xpon->last_start_error = ret;
