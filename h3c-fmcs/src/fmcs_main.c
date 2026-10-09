@@ -25,7 +25,7 @@ static struct fmcs_priv *g_fmcs_priv;
 static int fmcs_dev_open(struct inode *inode, struct file *file)
 {
 	file->private_data = g_fmcs_priv;
-	return 0;
+	return file->private_data ? 0 : -ENODEV;
 }
 
 static int fmcs_dev_release(struct inode *inode, struct file *file)
@@ -46,7 +46,7 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
 	if (cmd != FMCS_IOC_GET_FPGA_STATUS && cmd != FMCS_IOC_SET_CARRIER) {
 		int st = atomic_read(&priv->fpga_status);
-		if (st == FMCS_FPGA_STATUS_PROGRAMMING)
+		if (st != FMCS_FPGA_STATUS_READY && st != FMCS_FPGA_STATUS_FAILED)
 			return -EBUSY;
 		if (st == FMCS_FPGA_STATUS_FAILED)
 			return -EIO;
@@ -107,23 +107,23 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	}
 	case FMCS_IOC_RECV_PLOAM: {
 		struct fmcs_ploam_msg msg;
-		ret = wait_event_interruptible_timeout(priv->wq, priv->event_pending, msecs_to_jiffies(1000));
-		if (ret > 0 && priv->event_pending) {
-			size_t len = 0;
-			ret = fmcs_spi_recv_ploam(priv, msg.data, &len);
-			msg.len = len;
-			priv->event_pending = false;
-			if (!ret && copy_to_user((void __user *)arg, &msg, sizeof(msg)))
-				ret = -EFAULT;
-		} else if (ret == 0) {
-			ret = -ETIMEDOUT;
-		}
+		size_t len = 0;
+		memset(&msg, 0, sizeof(msg));
+		ret = fmcs_spi_recv_ploam(priv, msg.data, &len);
+		msg.len = (u32)len;
+		priv->event_pending = false;
+		if (!ret && copy_to_user((void __user *)arg, &msg, sizeof(msg)))
+			ret = -EFAULT;
 		break;
 	}
 	case FMCS_IOC_SEND_PACKET: {
 		struct fmcs_ploam_msg msg;
 		if (copy_from_user(&msg, (void __user *)arg, sizeof(msg))) {
 			ret = -EFAULT;
+			break;
+		}
+		if (msg.len != 13) {
+			ret = -EINVAL;
 			break;
 		}
 		ret = fmcs_spi_send_ploam(priv, msg.data, msg.len);
@@ -172,9 +172,11 @@ static irqreturn_t fmcs_irq_handler(int irq, void *dev_id)
 	u8 ploam_rx[16] = { 0 };
 	size_t ploam_len = 0;
 
-	mutex_lock(&priv->lock);
+	if (atomic_read(&priv->fpga_status) != FMCS_FPGA_STATUS_READY)
+		return IRQ_HANDLED;
 	/* Read FPGA event register 0x000000B0 */
-	fmcs_spi_read_fpga_reg(priv, 0x000000B0, &status_b0);
+	if (fmcs_spi_read_fpga_reg(priv, 0x000000B0, &status_b0))
+		return IRQ_HANDLED;
 
 	/* Bit 0 of 0xB0 indicates an incoming PLOAM frame from an ONU */
 	if (status_b0 & 0x1) {
@@ -185,7 +187,6 @@ static irqreturn_t fmcs_irq_handler(int irq, void *dev_id)
 			fmcs_rx_ploam_frame(priv, ploam_rx, ploam_len);
 		}
 	}
-	mutex_unlock(&priv->lock);
 
 	priv->event_pending = true;
 	wake_up_interruptible(&priv->wq);
@@ -207,13 +208,15 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 		return -ENODEV;
 	}
 
-	/* Avoid duplicate concurrent programming */
-	if (atomic_cmpxchg(&priv->fpga_status, FMCS_FPGA_STATUS_PROGRAMMING, FMCS_FPGA_STATUS_PROGRAMMING) == FMCS_FPGA_STATUS_PROGRAMMING) {
+	/* Serialize the transition with all existing SPI operations. */
+	mutex_lock(&priv->lock);
+	if (atomic_xchg(&priv->fpga_status, FMCS_FPGA_STATUS_PROGRAMMING) == FMCS_FPGA_STATUS_PROGRAMMING) {
+		mutex_unlock(&priv->lock);
 		dev_warn(priv->dev, "FPGA bitstream programming already in progress, ignoring duplicate request\n");
 		return -EBUSY;
 	}
 
-	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_PROGRAMMING);
+	mutex_unlock(&priv->lock);
 	priv->fpga_error = 0;
 
 	ret = request_firmware(&fw, fw_name, priv->dev);
@@ -298,7 +301,7 @@ static DEVICE_ATTR_WO(reload_fpga);
 
 static int fmcs_match_spi_child(struct device *dev, const void *data)
 {
-	return 1;
+	return dev->class && !strcmp(dev->class->name, "spi_master");
 }
 
 static struct spi_controller *fmcs_get_spi_controller(struct device_node *np)
@@ -331,6 +334,8 @@ static int fmcs_probe(struct platform_device *pdev)
 	priv->dev = dev;
 	mutex_init(&priv->lock);
 	init_waitqueue_head(&priv->wq);
+	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_NOT_STARTED);
+	INIT_WORK(&priv->fpga_work, fmcs_fpga_work_fn);
 
 	/* Map AN7581 SNFI/SPI and NFI MMIO Registers */
 	priv->spi_base = ioremap(AN7581_SPI_BASE_PHYS, AN7581_SPI_SIZE);
@@ -375,27 +380,28 @@ static int fmcs_probe(struct platform_device *pdev)
 				dev_warn(dev, "SPI controller found in DT but child device not found\n");
 		}
 	}
+	if (!priv->spi_ctrl) {
+		ret = dev_err_probe(dev, -EPROBE_DEFER,
+				    "SPI controller required for shared NAND bus locking\n");
+		goto err_maps;
+	}
 
 	/* Parse GPIO and Interrupts from Device Tree */
 	priv->gpiod_int = devm_gpiod_get_optional(dev, "fpga-spi-int", GPIOD_IN);
 	priv->gpiod_clk = devm_gpiod_get_optional(dev, "fpga-clk", GPIOD_OUT_LOW);
 	priv->gpiod_data = devm_gpiod_get_optional(dev, "fpga-data", GPIOD_OUT_LOW);
+	if (IS_ERR(priv->gpiod_int) || IS_ERR(priv->gpiod_clk) ||
+	    IS_ERR(priv->gpiod_data)) {
+		ret = IS_ERR(priv->gpiod_int) ? PTR_ERR(priv->gpiod_int) :
+		      IS_ERR(priv->gpiod_clk) ? PTR_ERR(priv->gpiod_clk) :
+		      PTR_ERR(priv->gpiod_data);
+		goto err_maps;
+	}
 
 	if (priv->gpiod_int)
 		priv->irq = gpiod_to_irq(priv->gpiod_int);
 	else
 		priv->irq = platform_get_irq_optional(pdev, 0);
-
-	if (priv->irq > 0) {
-		ret = devm_request_threaded_irq(dev, priv->irq, NULL,
-						fmcs_irq_handler,
-						IRQF_TRIGGER_HIGH | IRQF_ONESHOT | IRQF_SHARED,
-						"fmcs-irq", priv);
-		if (ret)
-			dev_warn(dev, "Failed to request IRQ %d: %d\n", priv->irq, ret);
-		else
-			dev_info(dev, "Registered FMCS IRQ %d\n", priv->irq);
-	}
 
 	/* Register Character Device /dev/fmcs_mci */
 	ret = alloc_chrdev_region(&priv->devno, 0, 1, FMCS_DEV_NAME);
@@ -414,17 +420,37 @@ static int fmcs_probe(struct platform_device *pdev)
 		goto err_class;
 	}
 
-	device_create(priv->class, NULL, priv->devno, NULL, FMCS_DEV_NAME);
+	{
+		struct device *mci_dev;
+
+		mci_dev = device_create(priv->class, NULL, priv->devno, NULL, FMCS_DEV_NAME);
+		if (IS_ERR(mci_dev)) {
+			ret = PTR_ERR(mci_dev);
+			goto err_device;
+		}
+	}
 
 	/* Initialize molt_omci and molt_ploam */
 	ret = fmcs_netdevs_init(priv);
 	if (ret)
-		dev_warn(dev, "Failed to register virtual netdevs: %d\n", ret);
+		goto err_netdevs;
+
+	/* Publish only fully initialized state; remove IRQ before tearing it down. */
+	g_fmcs_priv = priv;
+	platform_set_drvdata(pdev, priv);
+	if (priv->irq > 0) {
+		ret = devm_request_threaded_irq(dev, priv->irq, NULL,
+					      fmcs_irq_handler,
+					      IRQF_TRIGGER_HIGH | IRQF_ONESHOT | IRQF_SHARED,
+					      "fmcs-irq", priv);
+		if (ret) {
+			dev_warn(dev, "Failed to request IRQ %d: %d\n", priv->irq, ret);
+			priv->irq = 0;
+		}
+	}
 
 	/* Initialize FPGA async loader and sysfs status */
-	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_NOT_STARTED);
 	priv->fpga_error = 0;
-	INIT_WORK(&priv->fpga_work, fmcs_fpga_work_fn);
 	schedule_work(&priv->fpga_work);
 
 	ret = device_create_file(dev, &dev_attr_reload_fpga);
@@ -434,17 +460,20 @@ static int fmcs_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "Failed to create fpga_status sysfs attribute: %d\n", ret);
 
-	g_fmcs_priv = priv;
-	platform_set_drvdata(pdev, priv);
-
 	dev_info(dev, "H3C Micro-OLT FPGA Management Driver (FMCS) initialized successfully.\n");
 	return 0;
 
+err_netdevs:
+	device_destroy(priv->class, priv->devno);
+err_device:
+	class_destroy(priv->class);
 err_class:
 	cdev_del(&priv->cdev);
 err_cdev:
 	unregister_chrdev_region(priv->devno, 1);
 err_maps:
+	if (priv->spi_ctrl)
+		spi_controller_put(priv->spi_ctrl);
 	iounmap(priv->nfi_base);
 	iounmap(priv->spi_base);
 	return ret;
@@ -457,9 +486,12 @@ static void fmcs_remove(struct platform_device *pdev)
 	if (!priv)
 		return;
 
-	cancel_work_sync(&priv->fpga_work);
+	g_fmcs_priv = NULL;
 	device_remove_file(priv->dev, &dev_attr_fpga_status);
 	device_remove_file(priv->dev, &dev_attr_reload_fpga);
+	if (priv->irq > 0)
+		devm_free_irq(priv->dev, priv->irq, priv);
+	cancel_work_sync(&priv->fpga_work);
 	fmcs_netdevs_exit(priv);
 	device_destroy(priv->class, priv->devno);
 	class_destroy(priv->class);
@@ -473,7 +505,6 @@ static void fmcs_remove(struct platform_device *pdev)
 	if (priv->spi_ctrl)
 		spi_controller_put(priv->spi_ctrl);
 
-	g_fmcs_priv = NULL;
 }
 
 static const struct of_device_id fmcs_of_match[] = {
@@ -488,6 +519,8 @@ static struct platform_driver fmcs_driver = {
 	.driver = {
 		.name           = FMCS_DRV_NAME,
 		.of_match_table = fmcs_of_match,
+		/* Open character-device handles cannot survive platform unbind. */
+		.suppress_bind_attrs = true,
 	},
 };
 

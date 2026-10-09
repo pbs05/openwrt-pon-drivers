@@ -77,6 +77,7 @@ enum fmcs_fpga_status {
 #define AN7581_NFI_BASE_PHYS      0x1FA11000
 #define AN7581_NFI_SIZE           0x160
 
+/* Historical name: this is READ_IDLE_EN, not an interrupt-clear register. */
 #define REG_SPI_INT_CLEAR         0x0004
 #define REG_SPI_MANUAL_OP_CTRL    0x0014
 #define REG_SPI_MACMUX_STATUS     0x0018
@@ -92,6 +93,7 @@ enum fmcs_fpga_status {
 #define REG_SPI_DFIFO_RDATA       0x0044
 #define REG_SPI_CTRL_DUMMY        0x0080
 #define REG_SPI_CS_SEL            0x00E4
+#define REG_SPI_NFI2SPI_EN        0x0130
 
 #define SPI_OP_DEASSERT_CS        0x00
 #define SPI_OP_ASSERT_CS          0x01
@@ -138,6 +140,11 @@ struct fmcs_priv {
 	struct work_struct fpga_work;
 	atomic_t fpga_status;
 	int fpga_error;
+
+	/* Packet RX Hook on fttr0 */
+	struct packet_type fttr_pt;
+	struct sk_buff_head ploam_tx_queue;
+	struct work_struct ploam_tx_work;
 };
 
 /* Function Prototypes */
