@@ -61,6 +61,10 @@ struct fmcs_carrier_req {
 #define FMCS_IOC_SEND_PACKET     _IOW(FMCS_IOC_MAGIC, 6, struct fmcs_ploam_msg)
 #define FMCS_IOC_SET_CARRIER     _IOW(FMCS_IOC_MAGIC, 7, struct fmcs_carrier_req)
 #define FMCS_IOC_GET_FPGA_STATUS _IOR(FMCS_IOC_MAGIC, 8, __u32)
+/* Local extension: addr=ONU-ID 0..15, val=0 (default) or 0x100+ID.
+ * Exchanges the Ethernet OMCI channel; returns the previous val.
+ */
+#define FMCS_IOC_OMCI_CHANNEL _IOWR(FMCS_IOC_MAGIC, 9, struct fmcs_reg_op)
 
 enum fmcs_fpga_status {
 	FMCS_FPGA_STATUS_NOT_STARTED = 0,
@@ -130,6 +134,7 @@ struct fmcs_priv {
 
 	/* Virtual Net Devices */
 	struct net_device *omci_dev;
+	u16 omci_channel[16];
 	struct net_device *ploam_dev;
 	struct net_device *fttr_devs[FMCS_MAX_FTTR_PORTS];
 

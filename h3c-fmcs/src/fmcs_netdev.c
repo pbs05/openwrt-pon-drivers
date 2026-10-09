@@ -42,13 +42,10 @@ static netdev_tx_t fmcs_omci_xmit(struct sk_buff *skb, struct net_device *dev)
 	msg_type = be32_to_cpup((__be32 *)skb->data);
 	onu_id = be32_to_cpup((__be32 *)(skb->data + 4));
 
-	if (msg_type == 3 && onu_id <= 253) {
+	if (msg_type == 3 && onu_id <= 15 && skb->len == 56 &&
+	    !skb_linearize(skb)) {
 		/* Find destination master ethernet interface: fttr0 is the FPGA SerDes link */
 		dst_dev = dev_get_by_name(&init_net, "fttr0");
-		if (!dst_dev)
-			dst_dev = dev_get_by_name(&init_net, "lan1");
-		if (!dst_dev)
-			dst_dev = dev_get_by_name(&init_net, "eth0");
 
 		if (dst_dev) {
 			/* Allocate fresh skb with headroom for 16-byte header */
@@ -67,18 +64,26 @@ static netdev_tx_t fmcs_omci_xmit(struct sk_buff *skb, struct net_device *dev)
 				p[12] = 0x81;
 				p[13] = 0x00;
 				/* VLAN TCI: Priority=1 (0x2000) | ONU_ID */
-				vlan_tci = 0x2000 | (onu_id & 0x0fff);
+				vlan_tci = READ_ONCE(priv->omci_channel[onu_id]);
+				vlan_tci = 0x2000 | (vlan_tci ? vlan_tci : onu_id);
 				p[14] = (u8)(vlan_tci >> 8);
 				p[15] = (u8)(vlan_tci & 0xff);
 
 				/* Copy 48-byte OMCI payload */
 				memcpy(p + 16, skb->data + 8, omci_len);
 
+				/* Stock HSGMII TX pads the proprietary envelope to 68 bytes.
+				 * A 64-byte baseline envelope was observed to receive no reply.
+				 * Padding follows the OMCI CRC and is not part of the PDU.
+				 */
+				if (nskb->len < 68)
+					skb_put_zero(nskb, 68 - nskb->len);
+
 				nskb->dev = dst_dev;
 				skb_reset_mac_header(nskb);
 				skb_reset_network_header(nskb);
 				nskb->protocol = htons(0x88b5);
-				pr_info("fmcs: OMCI TX fttr0 onu_id %u len %u\n", onu_id, nskb->len);
+				pr_debug("fmcs: OMCI TX fttr0 onu_id %u len %u\n", onu_id, nskb->len);
 				dev_queue_xmit(nskb);
 			}
 			dev_put(dst_dev);
@@ -134,10 +139,10 @@ static netdev_tx_t fmcs_fttr_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	dst_dev = dev_get_by_name(&init_net, "fttr0");
 	if (dst_dev) {
-		/* VLAN TCI: Priority 0, VID = port_idx (1..16) */
-		vlan_tci = (u16)(port_priv->port_idx & 0x0fff);
+		/* Stock priority-0 envelope identifies GEM port 0x100 + ONU-ID. */
+		vlan_tci = (u16)((0x100 + port_priv->port_idx) & 0x0fff);
 		skb = vlan_insert_tag(skb, htons(ETH_P_8021Q), vlan_tci);
-		if (skb) {
+		if (skb && !skb_put_padto(skb, 68)) {
 			skb->dev = dst_dev;
 			dev_queue_xmit(skb);
 		}
@@ -225,6 +230,7 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 {
 	struct fmcs_priv *priv = (struct fmcs_priv *)pt->af_packet_priv;
 	u16 vlan_tci, vlan_id, priority;
+	u16 onu_id;
 	const u8 *eth_hdr;
 	size_t total_len;
 
@@ -256,16 +262,25 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 
 	priority = (vlan_tci >> 13) & 0x07;
 	vlan_id = vlan_tci & 0x0fff;
+	onu_id = vlan_id;
+	if (vlan_id >= 0x100 && vlan_id <= 0x10f &&
+	    READ_ONCE(priv->omci_channel[vlan_id - 0x100]) == vlan_id)
+		onu_id = vlan_id - 0x100;
 
 	/* Priority 1 (0x2000): OMCI response frame from sub-gateway */
-	if (priority == 1 && vlan_id <= 253) {
+	if (priority == 1 && onu_id <= 15) {
 		const u8 *omci_payload;
 		u8 omci_buf[56];
 
 		if (skb_vlan_tag_present(skb)) {
-			if (skb->len < 48)
+			/* This FPGA envelope has no inner Ethernet EtherType: OMCI
+			 * starts immediately after TCI at byte 16. VLAN untagging
+			 * removes four bytes, leaving the first two OMCI bytes in
+			 * the Ethernet h_proto field, before skb->data.
+			 */
+			if (total_len < 12 + 48)
 				goto out;
-			omci_payload = skb->data;
+			omci_payload = eth_hdr + 12;
 		} else {
 			if (total_len < 16 + 48)
 				goto out;
@@ -275,21 +290,21 @@ static int fmcs_rcv_packet(struct sk_buff *skb, struct net_device *dev,
 		/*
 		 * Deliver 56-byte frame to molt_omci:
 		 * [0..3]: htonl(3)
-		 * [4..7]: htonl(vlan_id as onu_id)
+		 * [4..7]: htonl(mapped ONU-ID)
 		 * [8..55]: 48-byte OMCI payload
 		 */
 		*(__be32 *)&omci_buf[0] = cpu_to_be32(3);
-		*(__be32 *)&omci_buf[4] = cpu_to_be32(vlan_id);
+		*(__be32 *)&omci_buf[4] = cpu_to_be32(onu_id);
 		memcpy(&omci_buf[8], omci_payload, 48);
 
-		pr_info("fmcs: OMCI RX fttr0 onu_id %u len %zu\n", vlan_id, sizeof(omci_buf));
+		pr_debug("fmcs: OMCI RX fttr0 onu_id %u len %zu\n", onu_id, sizeof(omci_buf));
 		fmcs_rx_omci_frame(priv, omci_buf, sizeof(omci_buf));
 		goto out;
 	}
 
-	/* Priority 0: Downstream data packet from ONU (fttr1..fttr16) */
-	if (priority == 0 && vlan_id >= 1 && vlan_id <= FMCS_MAX_FTTR_PORTS) {
-		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 1];
+	/* Priority 0: GEM 0x101..0x10f for the verified ONU-ID 1..15 slots. */
+	if (priority == 0 && vlan_id >= 0x101 && vlan_id <= 0x10f) {
+		struct net_device *sub_dev = priv->fttr_devs[vlan_id - 0x101];
 		if (sub_dev && (sub_dev->flags & IFF_UP)) {
 			bool tagged = !skb_vlan_tag_present(skb);
 			struct sk_buff *cskb;

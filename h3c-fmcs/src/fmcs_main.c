@@ -170,6 +170,23 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	}
 
 	switch (cmd) {
+	case FMCS_IOC_OMCI_CHANNEL: {
+		struct fmcs_reg_op op;
+		u32 channel;
+		if (copy_from_user(&op, (void __user *)arg, sizeof(op)))
+			return -EFAULT;
+		if (op.addr > 15 || (op.val && op.val != 0x100 + op.addr))
+			return -EINVAL;
+		channel = op.val;
+		mutex_lock(&priv->lock);
+		op.val = READ_ONCE(priv->omci_channel[op.addr]);
+		if (copy_to_user((void __user *)arg, &op, sizeof(op)))
+			ret = -EFAULT;
+		else
+			WRITE_ONCE(priv->omci_channel[op.addr], channel);
+		mutex_unlock(&priv->lock);
+		break;
+	}
 	case FMCS_IOC_GET_FPGA_STATUS: {
 		__u32 st = atomic_read(&priv->fpga_status);
 		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
