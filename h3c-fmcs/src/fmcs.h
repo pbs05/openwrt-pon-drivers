@@ -126,6 +126,10 @@ struct fmcs_priv {
 	struct gpio_desc *gpiod_int;
 	struct gpio_desc *gpiod_clk;
 	struct gpio_desc *gpiod_data;
+	struct gpio_desc *gpiod_config;
+	struct gpio_desc *gpiod_enable;
+	struct gpio_desc *gpiod_init;
+	struct gpio_desc *gpiod_done;
 
 	/* Char device */
 	dev_t devno;

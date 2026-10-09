@@ -10,6 +10,7 @@
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gpio/machine.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
@@ -304,6 +305,21 @@ static irqreturn_t fmcs_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/* Older HM2004 DTBs expose only clock/data/IRQ. Stock fpga_load additionally
+ * uses GPIO 5 (configuration reset), 22 (enable), 27 (INIT), 28 (DONE).
+ * Keep this compatibility mapping restricted to the verified board.
+ */
+static struct gpiod_lookup_table hm2004_fpga_gpios = {
+	.dev_id = "fmcs",
+	.table = {
+		GPIO_LOOKUP("1fbf0200.system-controller:pinctrl", 5, "fpga-config", GPIO_ACTIVE_HIGH),
+		GPIO_LOOKUP("1fbf0200.system-controller:pinctrl", 22, "fpga-enable", GPIO_ACTIVE_HIGH),
+		GPIO_LOOKUP("1fbf0200.system-controller:pinctrl", 27, "fpga-init", GPIO_ACTIVE_HIGH),
+		GPIO_LOOKUP("1fbf0200.system-controller:pinctrl", 28, "fpga-done", GPIO_ACTIVE_HIGH),
+		{ }
+	},
+};
+
 static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 {
 	const struct firmware *fw;
@@ -311,7 +327,8 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 	int bit;
 	int ret;
 
-	if (!priv->gpiod_clk || !priv->gpiod_data) {
+	if (!priv->gpiod_clk || !priv->gpiod_data || !priv->gpiod_config ||
+	    !priv->gpiod_enable || !priv->gpiod_init || !priv->gpiod_done) {
 		dev_warn(priv->dev, "FPGA programming GPIOs not configured\n");
 		atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_FAILED);
 		priv->fpga_error = -ENODEV;
@@ -345,7 +362,18 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 
 	gpiod_direction_output(priv->gpiod_clk, 0);
 	gpiod_direction_output(priv->gpiod_data, 0);
-	udelay(100);
+	/* Stock ExeLoadOnce: reset low >=1us, release, wait 5ms for INIT. */
+	gpiod_set_value_cansleep(priv->gpiod_enable, 0);
+	gpiod_set_value_cansleep(priv->gpiod_config, 0);
+	udelay(10);
+	gpiod_set_value_cansleep(priv->gpiod_config, 1);
+	msleep(5);
+	ret = gpiod_get_value_cansleep(priv->gpiod_init);
+	if (ret <= 0) {
+		ret = ret < 0 ? ret : -EIO;
+		goto failed;
+	}
+	udelay(300);
 
 	for (i = 0; i < fw->size; i++) {
 		u8 b = fw->data[i];
@@ -360,11 +388,24 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 			cond_resched();
 	}
 
+	ret = gpiod_get_value_cansleep(priv->gpiod_done);
+	if (ret <= 0) {
+		ret = ret < 0 ? ret : -EIO;
+		goto failed;
+	}
+	msleep(1);
+	gpiod_set_value_cansleep(priv->gpiod_enable, 1);
 	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_READY);
 	priv->fpga_error = 0;
 	dev_info(priv->dev, "FPGA bitstream programmed successfully! Micro-OLT active.\n");
 	release_firmware(fw);
 	return 0;
+failed:
+	priv->fpga_error = ret;
+	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_FAILED);
+	dev_err(priv->dev, "FPGA configuration handshake failed (%d); Micro-OLT disabled\n", ret);
+	release_firmware(fw);
+	return ret;
 }
 
 static void fmcs_fpga_work_fn(struct work_struct *work)
@@ -505,6 +546,21 @@ static int fmcs_probe(struct platform_device *pdev)
 	priv->gpiod_int = devm_gpiod_get_optional(dev, "fpga-spi-int", GPIOD_IN);
 	priv->gpiod_clk = devm_gpiod_get_optional(dev, "fpga-clk", GPIOD_OUT_LOW);
 	priv->gpiod_data = devm_gpiod_get_optional(dev, "fpga-data", GPIOD_OUT_LOW);
+	if (of_machine_is_compatible("h3c,hm2004-du"))
+		gpiod_add_lookup_table(&hm2004_fpga_gpios);
+	priv->gpiod_config = devm_gpiod_get_optional(dev, "fpga-config", GPIOD_OUT_HIGH);
+	priv->gpiod_enable = devm_gpiod_get_optional(dev, "fpga-enable", GPIOD_OUT_LOW);
+	priv->gpiod_init = devm_gpiod_get_optional(dev, "fpga-init", GPIOD_IN);
+	priv->gpiod_done = devm_gpiod_get_optional(dev, "fpga-done", GPIOD_IN);
+	if (of_machine_is_compatible("h3c,hm2004-du"))
+		gpiod_remove_lookup_table(&hm2004_fpga_gpios);
+	if (IS_ERR(priv->gpiod_config) || IS_ERR(priv->gpiod_enable) ||
+	    IS_ERR(priv->gpiod_init) || IS_ERR(priv->gpiod_done)) {
+		ret = IS_ERR(priv->gpiod_config) ? PTR_ERR(priv->gpiod_config) :
+		      IS_ERR(priv->gpiod_enable) ? PTR_ERR(priv->gpiod_enable) :
+		      IS_ERR(priv->gpiod_init) ? PTR_ERR(priv->gpiod_init) : PTR_ERR(priv->gpiod_done);
+		goto err_maps;
+	}
 	if (IS_ERR(priv->gpiod_int) || IS_ERR(priv->gpiod_clk) ||
 	    IS_ERR(priv->gpiod_data)) {
 		ret = IS_ERR(priv->gpiod_int) ? PTR_ERR(priv->gpiod_int) :
