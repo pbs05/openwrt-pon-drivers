@@ -92,6 +92,7 @@ enum fmcs_fpga_status {
 #define REG_SPI_DFIFO_RD          0x0040
 #define REG_SPI_DFIFO_RDATA       0x0044
 #define REG_SPI_CTRL_DUMMY        0x0080
+#define REG_SPI_TN                0x009c
 #define REG_SPI_CS_SEL            0x00E4
 #define REG_SPI_NFI2SPI_EN        0x0130
 

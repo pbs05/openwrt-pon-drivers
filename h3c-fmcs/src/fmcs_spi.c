@@ -18,10 +18,15 @@ static unsigned int spi_dummy = 1;
 module_param(spi_dummy, uint, 0600);
 MODULE_PARM_DESC(spi_dummy, "CS1 manual-mode dummy clocks (0..15)");
 
-/* HM2004 FPGA response starts one clock after the RX opcode begins. */
-static unsigned int spi_rx_skip = 1;
+/* TN=10 samples complete response bytes; no software bit shift is needed. */
+static unsigned int spi_rx_skip;
 module_param(spi_rx_skip, uint, 0600);
 MODULE_PARM_DESC(spi_rx_skip, "Leading CS1 response bits to clock past (0..7); captures an extra byte");
+
+/* Stock ISSUE_TN writes the low three sampling bits; retain its enable bit. */
+static unsigned int spi_tn = 10;
+module_param(spi_tn, uint, 0600);
+MODULE_PARM_DESC(spi_tn, "CS1 sampling TN (10 verified with CRC); restored for NAND");
 
 static bool ploam_trace;
 module_param(ploam_trace, bool, 0600);
@@ -29,7 +34,7 @@ MODULE_PARM_DESC(ploam_trace, "Log a raw aligned PLOAM RX sample at most once pe
 static DEFINE_RATELIMIT_STATE(ploam_trace_limit, 30 * HZ, 1);
 
 struct fmcs_spi_state {
-	u32 idle, toggle, manual, dummy, cs, nfi;
+	u32 idle, toggle, manual, dummy, cs, nfi, tn;
 };
 
 /* Caller owns both controller locks, as spi_mem_access_start() does. */
@@ -52,6 +57,7 @@ static void fmcs_spi_restore(struct fmcs_priv *priv,
 {
 	/* NAND exec_op does not select CS0: restore selection before unlocking. */
 	writel(state->cs, priv->spi_base + REG_SPI_CS_SEL);
+	writel(state->tn, priv->spi_base + REG_SPI_TN);
 	writel(state->dummy, priv->spi_base + REG_SPI_CTRL_DUMMY);
 	writel(state->toggle, priv->spi_base + REG_SPI_MANUAL_OP_CTRL);
 	writel(state->manual, priv->spi_base + REG_SPI_CTRL_MANUAL_EN);
@@ -72,6 +78,7 @@ static int fmcs_spi_prepare(struct fmcs_priv *priv,
 	state->dummy = readl(priv->spi_base + REG_SPI_CTRL_DUMMY);
 	state->cs = readl(priv->spi_base + REG_SPI_CS_SEL);
 	state->nfi = readl(priv->spi_base + REG_SPI_NFI2SPI_EN);
+	state->tn = readl(priv->spi_base + REG_SPI_TN);
 
 	/* Match the controller driver's manual-mode entry sequence. */
 	writel(0, priv->spi_base + REG_SPI_NFI2SPI_EN);
@@ -84,6 +91,7 @@ static int fmcs_spi_prepare(struct fmcs_priv *priv,
 	writel(1, priv->spi_base + REG_SPI_CTRL_MANUAL_EN);
 	writel(READ_ONCE(spi_dummy) & 0xf, priv->spi_base + REG_SPI_CTRL_DUMMY);
 	writel(1, priv->spi_base + REG_SPI_CS_SEL);
+	writel(READ_ONCE(spi_tn) & 0xf, priv->spi_base + REG_SPI_TN);
 	return 0;
 }
 
@@ -393,7 +401,7 @@ int fmcs_spi_recv_ploam(struct fmcs_priv *priv, u8 *data, size_t *len)
 		memcpy(data, rx, sizeof(rx));
 		if (len)
 			*len = sizeof(rx);
-		pr_info("fmcs: SPI recv PLOAM frame: msg_id 0x%02x, onu_id 0x%02x\n", rx[1], rx[0]);
+		pr_debug("fmcs: SPI recv PLOAM frame: msg_id 0x%02x, onu_id 0x%02x\n", rx[1], rx[0]);
 	} else {
 		if (len)
 			*len = 0;

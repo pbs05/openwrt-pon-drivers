@@ -39,6 +39,7 @@ typedef uint8_t u8;
 struct fmcs_priv { void *spi_base; void *spi_ctrl; int fpga_status; };
 static unsigned int spi_dummy = 1;
 static unsigned int spi_rx_skip = 1;
+static unsigned int spi_tn = 10;
 #define READ_ONCE(x) (x)
 #define atomic_read(x) (*(x))
 static int prepare_error, op_error, tx_error, rx_error, op_count;
@@ -54,6 +55,7 @@ static int an7581_spi_op_write(struct fmcs_priv *p, u32 cmd, u32 len)
     assert(readl(p->spi_base + REG_SPI_NFI2SPI_EN) == 0);
     assert(readl(p->spi_base + REG_SPI_CTRL_MANUAL_EN) == 1);
     assert(readl(p->spi_base + REG_SPI_CTRL_DUMMY) == spi_dummy);
+    assert(readl(p->spi_base + REG_SPI_TN) == spi_tn);
     return op_error == (int)cmd + 1 ? -ETIMEDOUT : 0;
 }
 static int an7581_spi_write_bytes(struct fmcs_priv *p, const u8 *b, u32 len)
@@ -63,8 +65,9 @@ static int an7581_spi_read_bytes(struct fmcs_priv *p, u8 *b, u32 len)
     (void)p;
     /* Leading zero bit, then 0xA55AC301; final payload LSB is in byte five. */
     const u8 wire[] = {0x52, 0xad, 0x61, 0x80, 0x80};
-    assert(len == sizeof(wire));
-    memcpy(b, wire, len);
+    const u8 aligned[] = {0xa5, 0x5a, 0xc3, 0x01};
+    assert(len == (spi_rx_skip ? sizeof(wire) : sizeof(aligned)));
+    memcpy(b, spi_rx_skip ? wire : aligned, len);
     return rx_error ? -EIO : 0;
 }
 """
@@ -76,6 +79,7 @@ int main(void)
     struct fmcs_priv p = { mmio, (void *)1, FMCS_FPGA_STATUS_READY };
     u8 tx[9] = {0}, rx[4];
     /* Preserve both the manual and DMA states used by NAND. */
+    for (spi_rx_skip = 0; spi_rx_skip < 2; ++spi_rx_skip) {
     for (int mode = 0; mode < 2; ++mode) {
         for (int read = 0; read < 2; ++read) {
             for (int fault = 0; fault < 6; ++fault) {
@@ -85,6 +89,7 @@ int main(void)
                 mmio[REG_SPI_CTRL_MANUAL_EN / 4] = mode ? 0 : 1;
                 mmio[REG_SPI_NFI2SPI_EN / 4] = mode;
                 mmio[REG_SPI_CTRL_DUMMY / 4] = 0;
+                mmio[REG_SPI_TN / 4] = 9;
                 memcpy(saved, mmio, sizeof(mmio));
                 prepare_error = fault == 1;
                 op_error = fault == 2 ? SPI_OP_ASSERT_CS + 1 :
@@ -104,6 +109,8 @@ int main(void)
             }
         }
     }
+    }
+    spi_rx_skip = 0;
     prepare_error = op_error = tx_error = rx_error = 0;
     p.fpga_status = FMCS_FPGA_STATUS_PROGRAMMING;
     op_count = 0;
@@ -111,7 +118,7 @@ int main(void)
     assert(fmcs_raw_spi_read_locked(&p, tx, 1, rx, 4) == -EBUSY);
     assert(op_count == 0);
     assert(!memcmp(mmio, saved, sizeof(mmio)));
-    puts("PASS: 24 success/fault transactions restore NAND state; programming blocks SPI");
+    puts("PASS: 48 success/fault transactions restore NAND/TN state; aligned and shifted RX; programming blocks SPI");
     return 0;
 }
 """
