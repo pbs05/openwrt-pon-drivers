@@ -22,6 +22,123 @@
 
 static struct fmcs_priv *g_fmcs_priv;
 
+/* All queue operations and hardware collectors hold ploam_rx_lock. */
+static void fmcs_ploam_flush_locked(struct fmcs_priv *priv)
+{
+	priv->rx_flushed += priv->ploam_rx_count;
+	priv->ploam_rx_head = priv->ploam_rx_count = 0;
+}
+
+static void fmcs_ploam_enqueue_locked(struct fmcs_priv *priv,
+				     const struct fmcs_ploam_msg *msg)
+{
+	u32 tail;
+
+	priv->rx_received++;
+	if (priv->ploam_rx_count == FMCS_PLOAM_RX_DEPTH) {
+		priv->rx_dropped++;
+		return;
+	}
+	tail = (priv->ploam_rx_head + priv->ploam_rx_count) % FMCS_PLOAM_RX_DEPTH;
+	priv->ploam_rx_queue[tail] = *msg;
+	priv->ploam_rx_count++;
+	priv->rx_enqueued++;
+}
+
+static int fmcs_ploam_dequeue(struct fmcs_priv *priv, void __user *dest)
+{
+	struct fmcs_ploam_msg empty = { 0 };
+	const struct fmcs_ploam_msg *msg;
+	int ret = 0;
+
+	mutex_lock(&priv->ploam_rx_lock);
+	msg = priv->ploam_rx_count ? &priv->ploam_rx_queue[priv->ploam_rx_head] : &empty;
+	/* Do not consume the head if the caller's buffer is invalid. */
+	if (copy_to_user(dest, msg, sizeof(*msg))) {
+		priv->rx_copy_faults++;
+		ret = -EFAULT;
+	} else if (priv->ploam_rx_count) {
+		priv->ploam_rx_head = (priv->ploam_rx_head + 1) % FMCS_PLOAM_RX_DEPTH;
+		priv->ploam_rx_count--;
+		priv->rx_dequeued++;
+	}
+	mutex_unlock(&priv->ploam_rx_lock);
+	return ret;
+}
+
+static unsigned int fmcs_ploam_collect(struct fmcs_priv *priv, bool irq)
+{
+	unsigned int n = 0;
+	u32 events;
+
+	mutex_lock(&priv->ploam_rx_lock);
+	if (irq)
+		priv->rx_irqs++;
+	if (atomic_read(&priv->fpga_status) != FMCS_FPGA_STATUS_READY)
+		goto out;
+	if (irq) {
+		/* Stock FmcsRecvPacketKthread reads raw 0xb0; bit 0 is PLOAM. */
+		if (fmcs_spi_read_fpga_reg(priv, 0xb0, &events)) {
+			priv->rx_errors++;
+			goto out;
+		}
+		if (events)
+			priv->rx_last_events = events;
+		if (!(events & 1))
+			goto out;
+	}
+	/* Polling is a fallback even if an event edge was missed. Each SPI
+	 * transaction releases the shared NAND bus; never drain unboundedly. */
+	for (; n < FMCS_PLOAM_RX_BUDGET; n++) {
+		struct fmcs_ploam_msg msg = { 0 };
+		size_t len = 0;
+
+		if (fmcs_spi_recv_ploam(priv, msg.data, &len)) {
+			priv->rx_errors++;
+			break;
+		}
+		if (!len) {
+			priv->rx_empty++;
+			break;
+		}
+		msg.len = len;
+		fmcs_ploam_enqueue_locked(priv, &msg);
+		/* Network delivery is a copy, never a competing hardware read. */
+		fmcs_rx_ploam_frame(priv, msg.data, msg.len);
+	}
+	if (n == FMCS_PLOAM_RX_BUDGET)
+		priv->rx_budget_hits++;
+out:
+	mutex_unlock(&priv->ploam_rx_lock);
+	return n;
+}
+
+static void fmcs_ploam_rx_work(struct work_struct *work)
+{
+	struct fmcs_priv *priv = container_of(to_delayed_work(work),
+					    struct fmcs_priv, ploam_rx_work);
+
+	fmcs_ploam_collect(priv, false);
+	schedule_delayed_work(&priv->ploam_rx_work, msecs_to_jiffies(10));
+}
+
+static ssize_t ploam_rx_stats_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct fmcs_priv *priv = dev_get_drvdata(dev);
+	ssize_t len;
+
+	mutex_lock(&priv->ploam_rx_lock);
+	len = sysfs_emit(buf, "received=%llu enqueued=%llu dequeued=%llu depth=%u dropped=%llu flushed=%llu empty=%llu errors=%llu copy_faults=%llu budget_hits=%llu irqs=%llu last_events=0x%08x\n",
+		priv->rx_received, priv->rx_enqueued, priv->rx_dequeued,
+		priv->ploam_rx_count, priv->rx_dropped, priv->rx_flushed,
+		priv->rx_empty, priv->rx_errors, priv->rx_copy_faults,
+		priv->rx_budget_hits, priv->rx_irqs, priv->rx_last_events);
+	mutex_unlock(&priv->ploam_rx_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(ploam_rx_stats);
+
 static int fmcs_dev_open(struct inode *inode, struct file *file)
 {
 	file->private_data = g_fmcs_priv;
@@ -106,14 +223,7 @@ static long fmcs_dev_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		break;
 	}
 	case FMCS_IOC_RECV_PLOAM: {
-		struct fmcs_ploam_msg msg;
-		size_t len = 0;
-		memset(&msg, 0, sizeof(msg));
-		ret = fmcs_spi_recv_ploam(priv, msg.data, &len);
-		msg.len = (u32)len;
-		priv->event_pending = false;
-		if (!ret && copy_to_user((void __user *)arg, &msg, sizeof(msg)))
-			ret = -EFAULT;
+		ret = fmcs_ploam_dequeue(priv, (void __user *)arg);
 		break;
 	}
 	case FMCS_IOC_SEND_PACKET: {
@@ -168,28 +278,11 @@ static const struct file_operations fmcs_fops = {
 static irqreturn_t fmcs_irq_handler(int irq, void *dev_id)
 {
 	struct fmcs_priv *priv = dev_id;
-	u32 status_b0 = 0;
-	u8 ploam_rx[16] = { 0 };
-	size_t ploam_len = 0;
 
-	if (atomic_read(&priv->fpga_status) != FMCS_FPGA_STATUS_READY)
-		return IRQ_HANDLED;
-	/* Read FPGA event register 0x000000B0 */
-	if (fmcs_spi_read_fpga_reg(priv, 0x000000B0, &status_b0))
-		return IRQ_HANDLED;
-
-	/* Bit 0 of 0xB0 indicates an incoming PLOAM frame from an ONU */
-	if (status_b0 & 0x1) {
-		if (fmcs_spi_recv_ploam(priv, ploam_rx, &ploam_len) == 0 && ploam_len > 0) {
-			memcpy(priv->last_ploam.data, ploam_rx, min_t(size_t, ploam_len, 16));
-			priv->last_ploam.len = ploam_len;
-			priv->event_pending = true;
-			fmcs_rx_ploam_frame(priv, ploam_rx, ploam_len);
-		}
-	}
-
-	priv->event_pending = true;
-	wake_up_interruptible(&priv->wq);
+	/* Bound repeated level interrupts with no PLOAM work. Do not guess
+	 * a hardware ACK: non-PLOAM event handling is investigated separately. */
+	if (!fmcs_ploam_collect(priv, true))
+		msleep(10);
 
 	return IRQ_HANDLED;
 }
@@ -209,14 +302,18 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 	}
 
 	/* Serialize the transition with all existing SPI operations. */
+	mutex_lock(&priv->ploam_rx_lock);
 	mutex_lock(&priv->lock);
 	if (atomic_xchg(&priv->fpga_status, FMCS_FPGA_STATUS_PROGRAMMING) == FMCS_FPGA_STATUS_PROGRAMMING) {
 		mutex_unlock(&priv->lock);
+		mutex_unlock(&priv->ploam_rx_lock);
 		dev_warn(priv->dev, "FPGA bitstream programming already in progress, ignoring duplicate request\n");
 		return -EBUSY;
 	}
 
 	mutex_unlock(&priv->lock);
+	fmcs_ploam_flush_locked(priv);
+	mutex_unlock(&priv->ploam_rx_lock);
 	priv->fpga_error = 0;
 
 	ret = request_firmware(&fw, fw_name, priv->dev);
@@ -333,7 +430,8 @@ static int fmcs_probe(struct platform_device *pdev)
 
 	priv->dev = dev;
 	mutex_init(&priv->lock);
-	init_waitqueue_head(&priv->wq);
+	mutex_init(&priv->ploam_rx_lock);
+	INIT_DELAYED_WORK(&priv->ploam_rx_work, fmcs_ploam_rx_work);
 	atomic_set(&priv->fpga_status, FMCS_FPGA_STATUS_NOT_STARTED);
 	INIT_WORK(&priv->fpga_work, fmcs_fpga_work_fn);
 
@@ -459,6 +557,10 @@ static int fmcs_probe(struct platform_device *pdev)
 	ret = device_create_file(dev, &dev_attr_fpga_status);
 	if (ret)
 		dev_warn(dev, "Failed to create fpga_status sysfs attribute: %d\n", ret);
+	ret = device_create_file(dev, &dev_attr_ploam_rx_stats);
+	if (ret)
+		dev_warn(dev, "Failed to create ploam_rx_stats: %d\n", ret);
+	schedule_delayed_work(&priv->ploam_rx_work, msecs_to_jiffies(10));
 
 	dev_info(dev, "H3C Micro-OLT FPGA Management Driver (FMCS) initialized successfully.\n");
 	return 0;
@@ -487,10 +589,12 @@ static void fmcs_remove(struct platform_device *pdev)
 		return;
 
 	g_fmcs_priv = NULL;
+	device_remove_file(priv->dev, &dev_attr_ploam_rx_stats);
 	device_remove_file(priv->dev, &dev_attr_fpga_status);
 	device_remove_file(priv->dev, &dev_attr_reload_fpga);
 	if (priv->irq > 0)
 		devm_free_irq(priv->dev, priv->irq, priv);
+	cancel_delayed_work_sync(&priv->ploam_rx_work);
 	cancel_work_sync(&priv->fpga_work);
 	fmcs_netdevs_exit(priv);
 	device_destroy(priv->class, priv->devno);

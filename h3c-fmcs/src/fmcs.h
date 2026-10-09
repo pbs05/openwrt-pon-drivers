@@ -108,6 +108,8 @@ enum fmcs_fpga_status {
 #define FMCS_SPI_CMD_READ_RESP    0x50
 
 #define FMCS_MAX_FTTR_PORTS 16
+#define FMCS_PLOAM_RX_DEPTH 64
+#define FMCS_PLOAM_RX_BUDGET 16
 
 /* Driver private structure */
 struct fmcs_priv {
@@ -132,9 +134,14 @@ struct fmcs_priv {
 
 	/* Synchronization */
 	struct mutex lock;
-	wait_queue_head_t wq;
-	bool event_pending;
-	struct fmcs_ploam_msg last_ploam;
+	/* Only the collector consumes hardware; ioctl consumes this FIFO. */
+	struct mutex ploam_rx_lock;
+	struct delayed_work ploam_rx_work;
+	struct fmcs_ploam_msg ploam_rx_queue[FMCS_PLOAM_RX_DEPTH];
+	u32 ploam_rx_head, ploam_rx_count;
+	u64 rx_received, rx_enqueued, rx_dequeued, rx_dropped, rx_flushed;
+	u64 rx_empty, rx_errors, rx_copy_faults, rx_budget_hits, rx_irqs;
+	u32 rx_last_events;
 
 	/* Asynchronous FPGA Bitstream Loader & Status */
 	struct work_struct fpga_work;
