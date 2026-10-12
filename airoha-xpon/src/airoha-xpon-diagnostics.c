@@ -496,6 +496,8 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "fifo_error: 0x%08x\n"
 		           "tx_error: 0x%08x\n"
 		           "rx_error: 0x%08x\n"
+		           "bwmap_check_control: 0x%08x\n"
+		           "bwmap_check_status: 0x%08x\n"
 		           "mbi_mpi_stop: 0x%08x\n"
 		           "eqd: 0x%08x\n"
 		           "tx_sync_ready: %u\n"
@@ -505,6 +507,10 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS),
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_DBG_BWM_CHK_CTRL),
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_DBG_BWM_CHK_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_EQD),
 		           !!(airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC) &

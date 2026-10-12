@@ -415,6 +415,9 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	airoha_xpon_xgpon_counters_start(xpon);
 	airoha_xpon_xgpon_release_mac_interfaces(xpon);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_US_PROF_VLD, 0);
+	/* MAC reset retains BWmap filters that can discard O5 PLOAMu grants. */
+	airoha_xgpon_write(xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL,
+	                   AIROHA_XGPON_BWM_CHK_CTRL_DEFAULT);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_RSP_TIME,
 	                         AIROHA_XGPON_RESPONSE_TIME_MASK, 0x551);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_O23_O4_PLOAMU_CTRL,

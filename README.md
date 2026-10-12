@@ -33,6 +33,22 @@ Work in progress. APIs may change substantially.
 
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
+Each XG-PON MAC activation initializes `DBG_BWM_CHK_CTRL` to the stock
+`0x00820000` baseline before publishing burst profiles. MAC reset does not
+clear inherited optional BWmap filters. On AN7583, an inherited
+`0x00821f1f` setting was observed to prevent registration ACK transmission:
+the ONU entered O5, then received OLT Deactivate without reaching OMCI.
+Using the stock baseline enabled ACK transmission, LOID authentication and
+service provisioning; restoring the inherited setting reproduced the failure.
+The `mac` snapshot exposes `bwmap_check_control` and `bwmap_check_status`.
+
+每次 XG-PON MAC 激活都会在发布 burst profile 前，将 `DBG_BWM_CHK_CTRL`
+初始化为原厂基准值 `0x00820000`。MAC 复位不会清除继承的可选 BWmap
+过滤设置。在 AN7583 上，实测继承值 `0x00821f1f` 会阻断注册 ACK 发送：
+ONU 进入 O5 后即被 OLT 撤销，无法进入 OMCI。使用原厂基准值后，ACK
+发送、LOID 认证和业务下发成功；恢复继承值则故障复现。
+`mac` 快照显示 `bwmap_check_control` 和 `bwmap_check_status`。
+
 With debugfs mounted, inspect
 `/sys/kernel/debug/airoha-xpon-<interface>/registration` and `mac` after a
 ranging attempt. The registration snapshot records the latest initial
