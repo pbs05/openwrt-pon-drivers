@@ -33,21 +33,47 @@ Work in progress. APIs may change substantially.
 
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
-Each XG-PON MAC activation initializes `DBG_BWM_CHK_CTRL` to the stock
-`0x00820000` baseline before publishing burst profiles. MAC reset does not
-clear inherited optional BWmap filters. On AN7583, an inherited
-`0x00821f1f` setting was observed to prevent registration ACK transmission:
-the ONU entered O5, then received OLT Deactivate without reaching OMCI.
-Using the stock baseline enabled ACK transmission, LOID authentication and
-service provisioning; restoring the inherited setting reproduced the failure.
-The `mac` snapshot exposes `bwmap_check_control` and `bwmap_check_status`.
+By default, XG-PON MAC activation preserves the existing `DBG_BWM_CHK_CTRL`
+settings. The load-time module parameter `xgpon_stock_bwmap=1` explicitly
+opts in to writing the stock AN7583 `0x00820000` baseline before publishing
+burst profiles on each MAC initialization. MAC reset does not clear inherited
+optional BWmap filters. This setting is not selected automatically by OLT vendor.
 
-每次 XG-PON MAC 激活都会在发布 burst profile 前，将 `DBG_BWM_CHK_CTRL`
-初始化为原厂基准值 `0x00820000`。MAC 复位不会清除继承的可选 BWmap
-过滤设置。在 AN7583 上，实测继承值 `0x00821f1f` 会阻断注册 ACK 发送：
-ONU 进入 O5 后即被 OLT 撤销，无法进入 OMCI。使用原厂基准值后，ACK
-发送、LOID 认证和业务下发成功；恢复继承值则故障复现。
+In an AN7583/HWTC test, replacing the inherited `0x00821f1f` setting with the
+stock baseline enabled ACK transmission, LOID acceptance and service provisioning;
+restoring the inherited setting reproduced early activation failure. Subsequent
+OLT deactivation still occurred with the stock baseline. Individual filter tests
+did not isolate the responsible bit, and ZTEG interoperability has not been
+verified. The opt-in is a diagnostic compatibility setting, not a complete
+registration fix. The `mac` snapshot exposes `bwmap_check_control` and
+`bwmap_check_status`.
+
+For an unloaded module, enable it with
+`modprobe airoha-xpon xgpon_stock_bwmap=1`. For persistent OpenWrt configuration,
+append `xgpon_stock_bwmap=1` to the existing `airoha-xpon` entry in
+`/etc/modules.d/`, then reboot. Do not add a second module entry or unload the
+driver on a live PON connection. The parameter is read-only after loading;
+inspect `/sys/module/airoha_xpon/parameters/xgpon_stock_bwmap` to check the
+selected setting. Omitting the parameter preserves the pre-r72 behavior of
+not writing this register; it does not restore a register changed earlier.
+
+默认情况下，XG-PON MAC 激活保留现有 `DBG_BWM_CHK_CTRL` 设置。只有在模块
+加载时指定 `xgpon_stock_bwmap=1`，才会在每次 MAC 初始化、发布 burst profile
+之前写入 AN7583 原厂基准值 `0x00820000`。MAC 复位不会清除继承的可选 BWmap
+过滤设置，也不会根据 OLT 厂商自动启用此选项。
+
+在 AN7583/HWTC 的一次测试中，将继承值 `0x00821f1f` 改为原厂基准值后，
+ACK 发送、LOID 接受和业务下发成功；恢复继承值则早期激活故障复现。但使用
+原厂基准值后仍发生后续 OLT 撤销，逐位测试也未确定具体原因，ZTEG 兼容性
+尚未验证。因此该选项是诊断兼容设置，不是完整注册修复。
 `mac` 快照显示 `bwmap_check_control` 和 `bwmap_check_status`。
+
+模块尚未加载时可使用 `modprobe airoha-xpon xgpon_stock_bwmap=1`。
+在 OpenWrt 上持久启用时，将 `xgpon_stock_bwmap=1` 追加到 `/etc/modules.d/`
+中已有的 `airoha-xpon` 条目后重启，不要新增重复条目，也不要在活动 PON
+连接上卸载驱动。参数加载后只读，可检查
+`/sys/module/airoha_xpon/parameters/xgpon_stock_bwmap`。
+不指定参数时保留 r72 之前不写此寄存器的行为，但不会还原此前已被修改的值。
 
 With debugfs mounted, inspect
 `/sys/kernel/debug/airoha-xpon-<interface>/registration` and `mac` after a

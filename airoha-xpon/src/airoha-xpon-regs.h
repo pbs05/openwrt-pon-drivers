@@ -139,7 +139,7 @@
 #define AIROHA_XGPON_BWM_O2349_CONTINUOUS_GRANT     BIT(17)
 
 /* Stock BWmap check baseline, with optional grant filters disabled. */
-#define AIROHA_XGPON_BWM_CHK_CTRL_DEFAULT 0x00820000
+#define AIROHA_XGPON_BWM_CHK_CTRL_STOCK 0x00820000
 
 /*
  * Bits 3 and 4 select hardware generation and verification of OMCI MIC with
