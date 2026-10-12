@@ -37,11 +37,14 @@ With debugfs mounted, inspect
 `/sys/kernel/debug/airoha-xpon-<interface>/registration` and `mac` after a
 ranging attempt. The registration snapshot records the latest initial
 Ranging-Time flags, EqD, TX synchronization state before and after the EqD
-write, PLOAMu FIFO state around the Ranging ACK, and the ACK submission result.
-It also exposes TX-late and resynchronization counters. These are observation
-only; they do not change ranging or ACK timing.
+write, the bounded TX-ready wait result, PLOAMu FIFO state around the Ranging
+ACK, and the ACK submission result. The driver waits up to 3000 us for TX
+synchronization before entering O5 and submitting the initial Ranging ACK. If
+the wait expires, it leaves the ONU in O4, does not submit the ACK, and records
+the timeout. The snapshot also exposes TX-late and resynchronization counters.
 
 挂载 debugfs 后，可在一次测距尝试后检查对应接口目录下的 `registration`
 和 `mac`。诊断快照记录最近一次初始 Ranging-Time 的 flags、EqD、EqD 写入前后
-的 TX 同步状态、Ranging ACK 前后的 PLOAMu FIFO 状态及 ACK 提交结果，并显示
-TX late 与重新同步计数。这些信息仅用于观测，不会改变测距或 ACK 时序。
+的 TX 同步状态、有界等待结果、Ranging ACK 前后的 PLOAMu FIFO 状态及 ACK
+提交结果，并显示 TX late 与重新同步计数。驱动在进入 O5 和提交首次 Ranging
+ACK 前最多等待 TX 同步 3000 微秒；超时则保持 O4、不提交 ACK，并记录超时。

@@ -919,14 +919,33 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	return 0;
 }
 
+static void airoha_xpon_save_ranging_diagnostic(
+	struct airoha_xpon *xpon,
+	struct airoha_xpon_ranging_diagnostic *diagnostic)
+{
+	unsigned long flags;
+
+	diagnostic->tx_late_errors =
+		READ_ONCE(xpon->stats.tx_late_error_count);
+	diagnostic->tx_resyncs = READ_ONCE(xpon->stats.tx_resync_count);
+	diagnostic->tx_resync_failures =
+		READ_ONCE(xpon->stats.tx_resync_failure_count);
+	diagnostic->ploamu_blocked = READ_ONCE(xpon->stats.ploamu_blocked);
+	diagnostic->valid = true;
+
+	spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+	xpon->ranging_diagnostic = *diagnostic;
+	spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+}
+
 static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
                                            const u8 *message)
 {
 	struct airoha_xpon_ranging_diagnostic diagnostic = {};
-	unsigned long flags;
 	u16 dest = get_unaligned_be16(message);
 	u32 eqd = get_unaligned_be32(message + 5);
 	int ack_result;
+	int ret;
 	bool absolute = message[4] & BIT(0);
 	bool positive = !(message[4] & BIT(1));
 
@@ -944,6 +963,40 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, eqd);
 		diagnostic.tx_sync_after =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
+		/*
+		 * The TX timing update must settle before entering O5 or sending
+		 * the Ranging ACK. The threaded IRQ can sleep during this bound.
+		 */
+		ret = readl_poll_timeout(
+			xpon->xgpon_base + AIROHA_XGPON_DBG_RESYNC,
+			diagnostic.tx_sync_after_wait,
+			diagnostic.tx_sync_after_wait &
+				AIROHA_XGPON_TX_SYNC_READY,
+			10, 3000);
+		diagnostic.tx_sync_wait_result = ret;
+		if (ret) {
+			diagnostic.fifo_before_ack = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+			airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
+			dev_warn(
+				xpon->dev,
+				"PLOAM ranging diagnostic: flags=0x%02x "
+				"absolute=%u positive=%u EqD=0x%08x "
+				"TX_SYNC_READY=%u->%u->%u wait=%d "
+				"ACK=not-attempted PLOAMu_FIFO=0x%08x; "
+				"stayed in O4\n",
+				diagnostic.flags, diagnostic.absolute,
+				diagnostic.positive, diagnostic.eqd,
+				!!(diagnostic.tx_sync_before &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				!!(diagnostic.tx_sync_after &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				!!(diagnostic.tx_sync_after_wait &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				ret, diagnostic.fifo_before_ack);
+			return ret;
+		}
+
 		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
 		/* O5 marks line activation; service_ready tracks usable service GEMs. */
 		xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
@@ -954,25 +1007,16 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
 		ack_result = airoha_xpon_send_ack(
 			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
+		diagnostic.ack_attempted = true;
 		diagnostic.ack_result = ack_result;
 		diagnostic.fifo_after_ack =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
-		diagnostic.tx_late_errors =
-			READ_ONCE(xpon->stats.tx_late_error_count);
-		diagnostic.tx_resyncs =
-			READ_ONCE(xpon->stats.tx_resync_count);
-		diagnostic.tx_resync_failures =
-			READ_ONCE(xpon->stats.tx_resync_failure_count);
-		diagnostic.ploamu_blocked =
-			READ_ONCE(xpon->stats.ploamu_blocked);
-		diagnostic.valid = true;
-		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
-		xpon->ranging_diagnostic = diagnostic;
-		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+		airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
 		dev_info(
 			xpon->dev,
 			"PLOAM ranging diagnostic: flags=0x%02x absolute=%u "
-			"positive=%u EqD=0x%08x TX_SYNC_READY=%u->%u ACK=%d "
+			"positive=%u EqD=0x%08x TX_SYNC_READY=%u->%u->%u "
+			"wait=%d ACK=%d "
 			"PLOAMu_FIFO=0x%08x->0x%08x tx_late=%u tx_resync=%u "
 			"tx_resync_failed=%u blocked=%u; entered O5; "
 			"service GEM/T-CONT mapping is still required\n",
@@ -982,6 +1026,9 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			   AIROHA_XGPON_TX_SYNC_READY),
 			!!(diagnostic.tx_sync_after &
 			   AIROHA_XGPON_TX_SYNC_READY),
+			!!(diagnostic.tx_sync_after_wait &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			diagnostic.tx_sync_wait_result,
 			diagnostic.ack_result, diagnostic.fifo_before_ack,
 			diagnostic.fifo_after_ack, diagnostic.tx_late_errors,
 			diagnostic.tx_resyncs, diagnostic.tx_resync_failures,

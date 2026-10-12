@@ -670,6 +670,9 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           "ranging_eqd: 0x%08x\n"
 		           "ranging_tx_sync_before: %u\n"
 		           "ranging_tx_sync_after: %u\n"
+		           "ranging_tx_sync_after_wait: %u\n"
+		           "ranging_tx_sync_wait_result: %d\n"
+		           "ranging_ack_attempted: %u\n"
 		           "ranging_ack_result: %d\n"
 		           "ranging_ploamu_fifo_before_ack: 0x%08x\n"
 		           "ranging_ploamu_fifo_after_ack: 0x%08x\n"
@@ -683,6 +686,10 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		              AIROHA_XGPON_TX_SYNC_READY),
 		           !!(ranging.tx_sync_after &
 		              AIROHA_XGPON_TX_SYNC_READY),
+		           !!(ranging.tx_sync_after_wait &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           ranging.tx_sync_wait_result,
+		           ranging.ack_attempted,
 		           ranging.ack_result, ranging.fifo_before_ack,
 		           ranging.fifo_after_ack, ranging.tx_late_errors,
 		           ranging.tx_resyncs, ranging.tx_resync_failures,
