@@ -581,6 +581,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	xpon->dev = dev;
 	mutex_init(&xpon->state_lock);
 	mutex_init(&xpon->ploam_lock);
+	spin_lock_init(&xpon->ranging_diagnostic_lock);
 	INIT_LIST_HEAD(&xpon->netlink_node);
 	INIT_WORK(&xpon->start_work, airoha_xpon_start_work);
 	INIT_DELAYED_WORK(&xpon->link_work, airoha_xpon_link_work);

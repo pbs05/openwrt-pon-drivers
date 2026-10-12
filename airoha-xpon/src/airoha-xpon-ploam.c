@@ -922,29 +922,70 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
                                            const u8 *message)
 {
+	struct airoha_xpon_ranging_diagnostic diagnostic = {};
+	unsigned long flags;
 	u16 dest = get_unaligned_be16(message);
 	u32 eqd = get_unaligned_be32(message + 5);
+	int ack_result;
 	bool absolute = message[4] & BIT(0);
 	bool positive = !(message[4] & BIT(1));
 
 	if (xpon->onu_state == AIROHA_XGPON_O4) {
 		if (dest != xpon->onu_id || !absolute)
 			return -EINVAL;
+
+		diagnostic.eqd = eqd;
+		diagnostic.flags = message[4];
+		diagnostic.absolute = absolute;
+		diagnostic.positive = positive;
+		diagnostic.tx_sync_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
 		xpon->eqd = eqd;
 		airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, eqd);
+		diagnostic.tx_sync_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
 		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
 		/* O5 marks line activation; service_ready tracks usable service GEMs. */
 		xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
 		airoha_xpon_update_omci_link(xpon);
 		if (xpon->data_path.configured && xpon->pon_netdev)
 			airoha_xpon_set_data_path_link(xpon, true);
+		diagnostic.fifo_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		ack_result = airoha_xpon_send_ack(
+			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
+		diagnostic.ack_result = ack_result;
+		diagnostic.fifo_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		diagnostic.tx_late_errors =
+			READ_ONCE(xpon->stats.tx_late_error_count);
+		diagnostic.tx_resyncs =
+			READ_ONCE(xpon->stats.tx_resync_count);
+		diagnostic.tx_resync_failures =
+			READ_ONCE(xpon->stats.tx_resync_failure_count);
+		diagnostic.ploamu_blocked =
+			READ_ONCE(xpon->stats.ploamu_blocked);
+		diagnostic.valid = true;
+		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+		xpon->ranging_diagnostic = diagnostic;
+		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
 		dev_info(
 			xpon->dev,
-			"PLOAM: absolute EqD=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
-			eqd);
-		/* Record the O-state even when a closed TX gate blocks its ACK. */
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_OK);
+			"PLOAM ranging diagnostic: flags=0x%02x absolute=%u "
+			"positive=%u EqD=0x%08x TX_SYNC_READY=%u->%u ACK=%d "
+			"PLOAMu_FIFO=0x%08x->0x%08x tx_late=%u tx_resync=%u "
+			"tx_resync_failed=%u blocked=%u; entered O5; "
+			"service GEM/T-CONT mapping is still required\n",
+			diagnostic.flags, diagnostic.absolute,
+			diagnostic.positive, diagnostic.eqd,
+			!!(diagnostic.tx_sync_before &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			!!(diagnostic.tx_sync_after &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			diagnostic.ack_result, diagnostic.fifo_before_ack,
+			diagnostic.fifo_after_ack, diagnostic.tx_late_errors,
+			diagnostic.tx_resyncs, diagnostic.tx_resync_failures,
+			diagnostic.ploamu_blocked);
 		return 0;
 	}
 

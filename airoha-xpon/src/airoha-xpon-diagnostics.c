@@ -496,13 +496,21 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "fifo_error: 0x%08x\n"
 		           "tx_error: 0x%08x\n"
 		           "rx_error: 0x%08x\n"
-		           "mbi_mpi_stop: 0x%08x\n",
+		           "mbi_mpi_stop: 0x%08x\n"
+		           "eqd: 0x%08x\n"
+		           "tx_sync_ready: %u\n"
+		           "ploamu_fifo_status: 0x%08x\n",
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_STATUS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_ENABLE),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS),
-		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP));
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_EQD),
+		           !!(airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC) &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_PLOAMU_FIFO_STS));
 	}
 out:
 	mutex_unlock(&xpon->state_lock);
@@ -582,6 +590,8 @@ DEFINE_SHOW_ATTRIBUTE(pon_datapath_debug);
 static int pon_registration_debug_show(struct seq_file *m, void *unused)
 {
 	struct airoha_xpon *xpon = m->private;
+	struct airoha_xpon_ranging_diagnostic ranging = {};
+	unsigned long flags;
 	bool epon;
 
 	mutex_lock(&xpon->state_lock);
@@ -636,8 +646,47 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           xpon->identity.active_identity.serial_configured,
 		           xpon->identity.active_identity
 		                   .registration_id_configured,
-		           xpon->stats.ploamd_accepted,
-		           xpon->stats.ploamd_rejected);
+		           READ_ONCE(xpon->stats.ploamd_accepted),
+		           READ_ONCE(xpon->stats.ploamd_rejected));
+		seq_printf(m,
+		           "ranging_requests: %u\n"
+		           "tx_late_errors: %u\n"
+		           "tx_resyncs: %u\n"
+		           "tx_resync_failures: %u\n"
+		           "ploamu_blocked: %u\n",
+		           READ_ONCE(xpon->stats.ranging_request_count),
+		           READ_ONCE(xpon->stats.tx_late_error_count),
+		           READ_ONCE(xpon->stats.tx_resync_count),
+		           READ_ONCE(xpon->stats.tx_resync_failure_count),
+		           READ_ONCE(xpon->stats.ploamu_blocked));
+		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+		ranging = xpon->ranging_diagnostic;
+		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+		seq_printf(m,
+		           "ranging_diagnostic_valid: %u\n"
+		           "ranging_flags: 0x%02x\n"
+		           "ranging_absolute: %u\n"
+		           "ranging_positive: %u\n"
+		           "ranging_eqd: 0x%08x\n"
+		           "ranging_tx_sync_before: %u\n"
+		           "ranging_tx_sync_after: %u\n"
+		           "ranging_ack_result: %d\n"
+		           "ranging_ploamu_fifo_before_ack: 0x%08x\n"
+		           "ranging_ploamu_fifo_after_ack: 0x%08x\n"
+		           "ranging_tx_late_errors: %u\n"
+		           "ranging_tx_resyncs: %u\n"
+		           "ranging_tx_resync_failures: %u\n"
+		           "ranging_ploamu_blocked: %u\n",
+		           ranging.valid, ranging.flags, ranging.absolute,
+		           ranging.positive, ranging.eqd,
+		           !!(ranging.tx_sync_before &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           !!(ranging.tx_sync_after &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           ranging.ack_result, ranging.fifo_before_ack,
+		           ranging.fifo_after_ack, ranging.tx_late_errors,
+		           ranging.tx_resyncs, ranging.tx_resync_failures,
+		           ranging.ploamu_blocked);
 	}
 	mutex_unlock(&xpon->state_lock);
 	return 0;

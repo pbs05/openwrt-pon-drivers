@@ -9,6 +9,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pcs/pcs-airoha.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -164,6 +165,23 @@ struct airoha_xpon_stats {
 	unsigned int ploamu_blocked;
 };
 
+struct airoha_xpon_ranging_diagnostic {
+	u32 eqd;
+	u32 tx_sync_before;
+	u32 tx_sync_after;
+	u32 fifo_before_ack;
+	u32 fifo_after_ack;
+	unsigned int tx_late_errors;
+	unsigned int tx_resyncs;
+	unsigned int tx_resync_failures;
+	unsigned int ploamu_blocked;
+	int ack_result;
+	u8 flags;
+	bool absolute;
+	bool positive;
+	bool valid;
+};
+
 struct airoha_xpon_identity_set {
 	/* ndo_open latches pending_identity into the active line epoch. */
 	struct airoha_xpon_identity default_identity;
@@ -241,8 +259,10 @@ struct airoha_xpon {
 	struct airoha_xpon_data_path_state data_path;
 	struct airoha_xpon_epon epon;
 	struct airoha_xpon_stats stats;
+	struct airoha_xpon_ranging_diagnostic ranging_diagnostic;
 	struct mutex state_lock;
 	struct mutex ploam_lock;
+	spinlock_t ranging_diagnostic_lock;
 	struct work_struct start_work;
 	struct delayed_work link_work;
 	struct list_head netlink_node;
