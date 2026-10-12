@@ -120,7 +120,7 @@ void airoha_xpon_clear_assignment(struct airoha_xpon *xpon)
 #define AIROHA_XGPON_PLOAMU_KEY_REPORT           0x05
 #define AIROHA_XGPON_PLOAMU_ACKNOWLEDGE          0x09
 #define AIROHA_XGPON_PLOAM_ACK_OK                0x00
-#define AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR     0x01
+#define AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR     0x05
 #define AIROHA_XGPON_KEY_CONTROL_GENERATE        0
 #define AIROHA_XGPON_KEY_CONTROL_CONFIRM         1
 #define AIROHA_XGPON_DATA_KEY_BYTES              16
@@ -627,15 +627,25 @@ static int airoha_xpon_send_ack(struct airoha_xpon *xpon, u8 seq,
                                 u8 completion_code)
 {
 	u8 message[AIROHA_XGPON_PLOAMU_BYTES] = {};
+	u32 key_index;
+	int ret;
 
 	/* Upstream PLOAM dest/msg/seq occupy bytes 4–7; downstream uses 0–3. */
+	key_index = airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+	message[3] = !!(key_index & AIROHA_XGPON_CUR_PIK_INDEX);
 	message[4] = xpon->onu_id >> 8;
 	message[5] = xpon->onu_id;
 	message[6] = AIROHA_XGPON_PLOAMU_ACKNOWLEDGE;
 	message[7] = seq;
 	message[8] = completion_code;
 
-	return airoha_xpon_send_ploamu(xpon, message);
+	ret = airoha_xpon_send_ploamu(xpon, message);
+	if (ret)
+		dev_warn_ratelimited(
+			xpon->dev,
+			"PLOAM ACK submission failed: seq=%u code=%u key-index=%u error=%d\n",
+			seq, completion_code, message[3], ret);
+	return ret;
 }
 
 static int airoha_xpon_send_registration(struct airoha_xpon *xpon, u8 seq)
@@ -1005,6 +1015,10 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xpon_set_data_path_link(xpon, true);
 		diagnostic.fifo_before_ack =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		diagnostic.ack_key_index =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+		diagnostic.ack_tx_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
 		ack_result = airoha_xpon_send_ack(
 			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
 		diagnostic.ack_attempted = true;
@@ -1033,7 +1047,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			diagnostic.fifo_after_ack, diagnostic.tx_late_errors,
 			diagnostic.tx_resyncs, diagnostic.tx_resync_failures,
 			diagnostic.ploamu_blocked);
-		return 0;
+		return ack_result;
 	}
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 ||
@@ -1048,6 +1062,10 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		xpon->eqd -= min(eqd, xpon->eqd);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, xpon->eqd);
 
+	if (dest == xpon->onu_id)
+		return airoha_xpon_send_ack(xpon, message[3],
+		                            AIROHA_XGPON_PLOAM_ACK_OK);
+
 	return 0;
 }
 
@@ -1058,7 +1076,7 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	u16 alloc_id = (message[4] & 0x3f) << 8 | message[5];
 	u8 type = message[6];
 	u8 index;
-	int ret;
+	int ret, ack_result;
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id ||
 	    alloc_id == xpon->onu_id)
@@ -1071,16 +1089,13 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	else
 		ret = -EINVAL;
 
-	if (ret)
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR);
-	else
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_OK);
+	ack_result = airoha_xpon_send_ack(
+		xpon, message[3], ret ? AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR :
+		                       AIROHA_XGPON_PLOAM_ACK_OK);
 	/* drain holds only ploam_lock; link_work applies under state_lock. */
 	if (!ret && type == 1 && READ_ONCE(xpon->data_path.pending_count))
 		atomic_set(&xpon->data_path_retry_pending, 1);
-	return ret;
+	return ret ?: ack_result;
 }
 
 static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
@@ -1098,6 +1113,10 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		if (dest != AIROHA_XGPON_BROADCAST_ID && dest != xpon->onu_id)
 			return -EADDRNOTAVAIL;
 		ret = airoha_xpon_program_profile(xpon, message);
+		if (!ret && xpon->onu_state == AIROHA_XGPON_O5 &&
+		    dest == xpon->onu_id)
+			ret = airoha_xpon_send_ack(
+				xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
 		break;
 	case AIROHA_XGPON_PLOAMD_ASSIGN_ONU_ID:
 		ret = airoha_xpon_accept_assign_onu_id(xpon, message);
@@ -1124,6 +1143,19 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		    dest != AIROHA_XGPON_ALL_ONU_ID)
 			ret = -EINVAL;
 		else {
+			unsigned long flags;
+
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			if (xpon->ranging_diagnostic.valid &&
+			    xpon->onu_state == AIROHA_XGPON_O5) {
+				xpon->ranging_diagnostic.ack_tx_at_deactivate =
+					airoha_xgpon_read(
+						xpon,
+						AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+				xpon->ranging_diagnostic.deactivated = true;
+			}
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                        flags);
 			/* PLAIN_RESET preserves PHY sync; link_work resets the MAC after
 			 * releasing ploam_lock.
 			 */

@@ -172,6 +172,9 @@ struct airoha_xpon_ranging_diagnostic {
 	u32 tx_sync_after_wait;
 	u32 fifo_before_ack;
 	u32 fifo_after_ack;
+	u32 ack_key_index;
+	u32 ack_tx_before;
+	u32 ack_tx_at_deactivate;
 	unsigned int tx_late_errors;
 	unsigned int tx_resyncs;
 	unsigned int tx_resync_failures;
@@ -182,6 +185,7 @@ struct airoha_xpon_ranging_diagnostic {
 	bool absolute;
 	bool positive;
 	bool ack_attempted;
+	bool deactivated;
 	bool valid;
 };
 

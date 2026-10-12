@@ -650,11 +650,13 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           READ_ONCE(xpon->stats.ploamd_rejected));
 		seq_printf(m,
 		           "ranging_requests: %u\n"
+		           "registrations_sent: %u\n"
 		           "tx_late_errors: %u\n"
 		           "tx_resyncs: %u\n"
 		           "tx_resync_failures: %u\n"
 		           "ploamu_blocked: %u\n",
 		           READ_ONCE(xpon->stats.ranging_request_count),
+		           READ_ONCE(xpon->stats.registration_sent_count),
 		           READ_ONCE(xpon->stats.tx_late_error_count),
 		           READ_ONCE(xpon->stats.tx_resync_count),
 		           READ_ONCE(xpon->stats.tx_resync_failure_count),
@@ -674,6 +676,10 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           "ranging_tx_sync_wait_result: %d\n"
 		           "ranging_ack_attempted: %u\n"
 		           "ranging_ack_result: %d\n"
+		           "ranging_ack_key_index: 0x%08x\n"
+		           "ranging_ack_tx_before: %u\n"
+		           "ranging_deactivated: %u\n"
+		           "ranging_ack_tx_at_deactivate: %u\n"
 		           "ranging_ploamu_fifo_before_ack: 0x%08x\n"
 		           "ranging_ploamu_fifo_after_ack: 0x%08x\n"
 		           "ranging_tx_late_errors: %u\n"
@@ -690,7 +696,9 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		              AIROHA_XGPON_TX_SYNC_READY),
 		           ranging.tx_sync_wait_result,
 		           ranging.ack_attempted,
-		           ranging.ack_result, ranging.fifo_before_ack,
+		           ranging.ack_result, ranging.ack_key_index,
+		           ranging.ack_tx_before, ranging.deactivated,
+		           ranging.ack_tx_at_deactivate, ranging.fifo_before_ack,
 		           ranging.fifo_after_ack, ranging.tx_late_errors,
 		           ranging.tx_resyncs, ranging.tx_resync_failures,
 		           ranging.ploamu_blocked);
