@@ -132,6 +132,7 @@ struct en7572 {
 	bool prepared;
 	enum airoha_pon_frontend_mode prepared_mode;
 	bool tx_gate_enabled;
+	bool md32_needs_reload;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -678,6 +679,29 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	if (base < 0)
 		return base;
 
+	mutex_lock(&en->lock);
+	en->prepared = false;
+	en->tx_gate_enabled = false;
+	if (en->tx_disable)
+		gpiod_set_value_cansleep(en->tx_disable, 1);
+
+	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
+	                         EN7572_BEN_MODE_OFF);
+	if (ret)
+		goto out_unlock;
+
+	/* Probe supplies the first fresh image; subsequent starts discard APC state. */
+	if (en->md32_needs_reload) {
+		ret = en7572_initialize_md32(en);
+		if (ret) {
+			dev_err(&en->program->dev,
+			        "MD32 reload failed: %d; burst TX remains disabled\n",
+			        ret);
+			goto out_unlock;
+		}
+	}
+	en->md32_needs_reload = true;
+
 	/*
 	 * When the selected BOB table is empty, MD32 manages analog defaults
 	 * internally. Avoid writing erased bytes as extreme register values.
@@ -688,21 +712,9 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 			&en->program->dev,
 			"BOB table for %s is empty; letting MD32 self-manage analog defaults\n",
 			en7572_mode_name(mode));
-		mutex_lock(&en->lock);
-		en->prepared_mode = mode;
-		en->prepared = true;
-		mutex_unlock(&en->lock);
-		return 0;
+		ret = 0;
+		goto out_prepared;
 	}
-
-	mutex_lock(&en->lock);
-	en->prepared = false;
-	en->tx_gate_enabled = false;
-
-	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
-	                         EN7572_BEN_MODE_OFF);
-	if (ret)
-		goto out_unlock;
 
 	ret = en7572_update_bits(
 		en, EN7572_DCL_CTRL_2, EN7572_DCL_IMOD_MASK,
@@ -777,6 +789,7 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	ret = en7572_update_bits(en, EN7572_LOOP_CTRL, BIT(0), 0);
 	if (!ret)
 		ret = en7572_update_bits(en, EN7572_LOOP_CTRL, BIT(0), BIT(0));
+out_prepared:
 	if (!ret) {
 		en->prepared_mode = mode;
 		en->prepared = true;
@@ -883,10 +896,11 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 	struct en7572 *en = airoha_pon_frontend_priv(frontend);
 	int ret;
 
-	if (enable && !en->prepared)
-		return -EAGAIN;
-
 	mutex_lock(&en->lock);
+	if (enable && !en->prepared) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
 	if (enable) {
 		/* Enter burst mode before releasing the board TX_DISABLE gate. */
 		ret = en7572_update_bits(en, EN7572_BEN_CTRL,
@@ -906,6 +920,7 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 		                         EN7572_BEN_MODE_MASK,
 		                         EN7572_BEN_MODE_OFF);
 	}
+out_unlock:
 	mutex_unlock(&en->lock);
 
 	return ret;

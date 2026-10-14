@@ -425,6 +425,11 @@ static void airoha_xpon_link_work(struct work_struct *work)
 
 	if (ret) {
 		xpon->last_start_error = ret;
+		if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
+			airoha_xpon_xgpon_drain_ploamd_locked(xpon);
+			if (atomic_xchg(&xpon->mac_restart_pending, 0))
+				airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
+		}
 		xpon->lifecycle = AIROHA_XPON_ERROR;
 		delay = msecs_to_jiffies(AIROHA_XPON_RETRAIN_RETRY_MS);
 		dev_warn_ratelimited(
@@ -446,6 +451,7 @@ static void airoha_xpon_link_work(struct work_struct *work)
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
+		airoha_xpon_xgpon_drain_ploamd_locked(xpon);
 		if (atomic_xchg(&xpon->mac_restart_pending, 0))
 			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
 		if (atomic_xchg(&xpon->data_path_retry_pending, 0))

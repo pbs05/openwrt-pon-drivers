@@ -209,6 +209,7 @@ struct airoha_xpon_crypto_state {
 	unsigned int key_report_tx_count;
 	unsigned int key_exchange_completed_count;
 	unsigned int key_exchange_error_count;
+	unsigned int key_switch_timeout_count;
 	enum airoha_xgpon_key_exchange_state exchange_state;
 	u8 data_keys[2][16];
 	u8 encrypted_data_key[16];

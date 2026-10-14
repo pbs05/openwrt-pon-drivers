@@ -32,6 +32,7 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 	u32 sync_state;
 	int ret;
 
+	lockdep_assert_held(&xpon->state_lock);
 	if (READ_ONCE(xpon->tx_armed))
 		return 0;
 	if (READ_ONCE(xpon->stopping) || !xpon->optical_signal ||
@@ -1092,7 +1093,7 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	ack_result = airoha_xpon_send_ack(
 		xpon, message[3], ret ? AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR :
 		                       AIROHA_XGPON_PLOAM_ACK_OK);
-	/* drain holds only ploam_lock; link_work applies under state_lock. */
+	/* link_work applies pending mappings after the FIFO lock is released. */
 	if (!ret && type == 1 && READ_ONCE(xpon->data_path.pending_count))
 		atomic_set(&xpon->data_path_retry_pending, 1);
 	return ret ?: ack_result;
@@ -1179,7 +1180,7 @@ unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon)
 {
 	unsigned int count;
 
-	/* T-CONT/GEM share a command port with manual data-path updates. */
+	lockdep_assert_held(&xpon->state_lock);
 	mutex_lock(&xpon->ploam_lock);
 	for (count = 0; count < AIROHA_XGPON_PLOAMD_MAX_DRAIN; count++) {
 		u8 message[AIROHA_XGPON_PLOAMD_BYTES];

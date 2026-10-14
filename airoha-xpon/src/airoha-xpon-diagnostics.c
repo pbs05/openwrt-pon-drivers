@@ -539,11 +539,13 @@ static int pon_crypto_debug_show(struct seq_file *m, void *unused)
 		           "activation_keys_programmed: %d\n"
 		           "key_exchange_state: %u\n"
 		           "key_exchange_errors: %u\n"
+		           "key_switch_timeouts: %u\n"
 		           "current_key_index: 0x%08x\n",
 		           xpon->crypto.default_ploam_ik_programmed,
 		           xpon->crypto.activation_keys_programmed,
 		           xpon->crypto.exchange_state,
 		           xpon->crypto.key_exchange_error_count,
+		           xpon->crypto.key_switch_timeout_count,
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX));
 	mutex_unlock(&xpon->state_lock);
 	return 0;

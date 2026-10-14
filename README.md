@@ -33,6 +33,44 @@ Work in progress. APIs may change substantially.
 
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
+### Improvements informed by other drivers (xPON r75 / frontend r15)
+
+External fixes are compared and adapted, not merged as whole driver trees:
+
+| Source | Integration |
+| --- | --- |
+| [gbosek `a65fa75`](https://github.com/gbosek/openwrt-pon-drivers/commit/a65fa752647028fcea8395315d54d5e8c031f78e) | Its r70 restores the original r68 AES/IRQ behavior, already present here. |
+| [lunatickochiya `e369dd6`](https://github.com/lunatickochiya/openwrt-pon-drivers/commit/e369dd6335a3ae2d8b3fc49bb433abc7379f7464) | Keep AES switch completion advisory; add a rate-limited warning and `key_switch_timeouts` in the `crypto` snapshot rather than silently ignoring it or aborting Key Confirm. |
+| [liuyuf78fk `3e581b6`](https://github.com/liuyuf78fk/openwrt-pon-drivers/commit/3e581b6ca6b9b5223e0739d6bf53053a5a489ea9) | Try `state_lock` in the threaded IRQ and defer FIFO draining to `link_work` on contention, preserving `state_lock -> ploam_lock` without blocking an IRQ that recovery synchronizes. Do not import its fatal advisory AES timeout. |
+| [naoki66 `e19bde0`](https://github.com/naoki66/openwrt-pon-drivers/commit/e19bde08ac3f3218a783f22165d9a5ded06046d2) | Do not import the proposed seven-state model or its fatal AES timeout. No state-machine replacement is part of this release. |
+| [yveming `4b2f9df`](https://github.com/yveming/openwrt-pon-drivers/commit/4b2f9df548f8ec993cf6b6d338277eaecccf8c52) | Reload EN7572 MD32 on subsequent interface starts, including empty-table profiles; reuse probe's fresh image on the first prepare. |
+| [qianxuu `5257f0c`](https://github.com/qianxuu/openwrt-pon-drivers/commit/5257f0c247f863d202eac1fc7f206f85e23aed67) | Empty-table MD32 defaults were already integrated; preserve r14's calibration validation. |
+| [yveming `176afc7`](https://github.com/yveming/openwrt-pon-drivers/commit/176afc7379ee2a6f6ffcbe03dd9988326d6c64fb) | Do not copy the complete A2 analog calibration into A0 automatically; retain per-profile data and the existing empty-profile defaults. |
+
+The external state-machine patch is not a drop-in XG-PON correction:
+G.987.3 (01/2014), clauses 11.3.3.5 and 12.2, retain combined `O2_3`;
+Disable_Serial_Number option `0x0f` disables all ONUs, not enables them.
+Its O6 handling would also discard the O5 epoch before the recommended 100 ms
+TO2 expires. These changes do not establish the cause of the observed OLT
+Deactivate. Proper O6/O7 support, including emergency-stop persistence, remains
+separate work; this release preserves the existing activation/recovery behavior.
+
+AES advisory timeout compatibility does not prove that the hardware switched
+keys. The warning and per-epoch counter expose this uncertainty; no keys or
+credentials are logged. Existing ranging ACK, BWmap and invalid-BOB safeguards
+remain in place. Unsupported GPON MAC support is not enabled by importing a
+different fork's experimental mode/PHY changes.
+
+参考外部分支完善当前驱动，而非整包合并：保留 AES 超时不阻断 Confirm 的行为，但增加告警和计数；
+统一 PLOAM 锁顺序并在 IRQ 锁竞争时延后处理；线路再次启动时重新加载 MD32，
+失败明确报错且保持 TX 关闭。本次不替换状态机，不照搬 O2/O3 拆分或错误的 DisableSN 解释；
+不自动跨模式复制整块模拟校准，不启用未经验证的 GPON 实验路径。
+这些是源码整合，尚不代表已在 AN7583/HWTC 上验证稳定 O5。
+
+Source-level regressions require Python 3 and the pure-Python `pycparser`
+package. Run `python3 -m unittest discover -s tests -v`; they do not build the
+driver or replace kernel type checking and on-device validation.
+
 By default, XG-PON MAC activation preserves the existing `DBG_BWM_CHK_CTRL`
 settings. Enabling stock BWmap compatibility writes the stock AN7583
 `0x00820000` baseline before publishing burst profiles on each MAC initialization.
