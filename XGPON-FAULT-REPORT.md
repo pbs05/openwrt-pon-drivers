@@ -24,9 +24,9 @@ Registration-ID 内容或密钥。
 
 | # | 故障或现象 | 已取得证据 | 当前判断 | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | XG-PON 激活循环，无法稳定上线 | 稳定重复 `O2_3 → O4 → O5 → Deactivate → O2_3`；最新固件至少一次在 O5 收到三次 `Assign Alloc-ID 0x0a` 后被撤销 | 当前最高可信故障点是默认 Alloc-ID ACK 缺失 | 已修复源码，等待设备验证 |
+| 1 | XG-PON 激活循环，无法稳定上线 | 稳定重复 `O2_3 → O4 → O5 → Deactivate → O2_3`；最新固件至少一次在 O5 收到三次消息类型 `0x0a`（`Assign_Alloc-ID`）后被撤销 | 当前最高可信故障点是默认 Alloc-ID ACK 缺失 | 已修复源码，等待设备验证 |
 | 2 | OMCI 完全未建立 | OMCI 收发计数持续为 0，密钥交换也未开始 | 不是 OMCI 配置协商失败，而是 OLT 在 OMCI 之前已撤销 ONU | 已确认是主故障的结果，不是首要根因 |
-| 3 | OLT 下发流程在 O5 中终止 | 历史周期曾进入 Request Registration；最新周期中 HWTC 三次重发 `Assign Alloc-ID 0x0a` 后 Deactivate | 若该 Alloc-ID 等于 ONU-ID，旧驱动直接拒绝且不发 ACK；vendor 会用 shadow T-CONT 0 并 ACK OK | 已按 vendor 行为修复 |
+| 3 | OLT 下发流程在 O5 中终止 | 历史周期曾进入 Request Registration；最新周期中 HWTC 三次重发消息类型 `0x0a`（`Assign_Alloc-ID`）后 Deactivate | 若消息内的实际 Alloc-ID 等于 ONU-ID，旧驱动直接拒绝且不发 ACK；vendor 会用 shadow T-CONT 0 并 ACK OK | 已按 vendor 行为修复 |
 | 4 | 首次 Ranging ACK 可能早于 TX 时序同步完成 | 上机诊断显示 EqD 写前、写后和 ACK 阶段 `TX_SYNC_READY=1`，ACK 返回 0 | 本机样本不支持 ACK 等待假设；Issue #3 的 vendor 等待仍是有效外部证据，但不是当前首要方向 | 已基本排除 |
 | 5 | Ranging ACK 返回值原先被忽略 | `airoha_xpon_send_ack()` 返回值未被记录；TX gate 关闭、FIFO overrun、空间不足均不可观察 | 即使 ACK 没有成功提交，旧日志也可能表现为已经进入 O5 | 已在本地诊断补丁中修复不可观察问题，不改变协议行为 |
 | 6 | PLOAMu FIFO 可能堵塞或空间不足 | 上机诊断显示 FIFO 无 overrun、可用空间充足，Ranging ACK 提交成功 | 首次测距 ACK 没有卡在 FIFO；Registration 仍需独立采集提交和发送计数 | 测距路径已排除，已增加 Registration FIFO 快照 |
@@ -61,8 +61,9 @@ Registration-ID 内容或密钥。
 
 1. 首次 Ranging ACK 已在 O5 后、`TX_SYNC_READY=1` 时成功入 FIFO，随后
    `TX_PLOAMU_CNT` 和 `TX_ACK_PLOAMU_CNT` 均增长，不能再判断为完全未发送。
-2. HWTC 随后至少一次连续三次下发 `Assign Alloc-ID 0x0a`，但没有继续建立
-   OMCI，最终 Deactivate。
+2. HWTC 随后至少一次连续三次下发消息类型 `0x0a`（`Assign_Alloc-ID`），
+   但旧日志没有打印消息内的实际 Alloc-ID；OLT 没有继续建立 OMCI，最终
+   Deactivate。
 3. 驱动自身已注明 T-CONT 0 shadow ONU-ID，却在
    `airoha_xpon_accept_alloc_id()` 中把 `alloc_id == onu_id` 当作 `-EINVAL`
    直接返回，因此不会发送任何 ACK。
@@ -72,9 +73,10 @@ Registration-ID 内容或密钥。
    可以注册。r76 已按 vendor 行为修复：默认 Alloc-ID 使用 shadow T-CONT 0
    并 ACK OK；其他 Alloc-ID 路径不变。
 
-该判断仍需设备实测确认 `0x0a` 同时是当轮 ONU-ID，并确认修复后 OLT 不再
-重复该消息而继续 Request Registration/OMCI。若仍失败，再回到 Registration
-MIC/PIK 和消息内容排查。
+该判断仍需设备实测确认消息内的实际 Alloc-ID 等于当轮 ONU-ID，并确认修复后
+OLT 不再重复该消息而继续 Request Registration/OMCI。`0x0a` 仅是下行消息
+类型，不是实际 Alloc-ID。若仍失败，再回到 Registration MIC/PIK 和消息内容
+排查。
 
 Issue #3 所引用的 Airoha vendor 路径为：
 
