@@ -34,8 +34,11 @@ def uncomment(text):
     )
 
 
-SOURCES = {p.name: uncomment(p.read_text()) for p in XPON.glob("*.[ch]")}
-SOURCES[EN.name] = uncomment(EN.read_text())
+SOURCES = {
+    p.name: uncomment(p.read_text(encoding="utf-8"))
+    for p in XPON.glob("*.[ch]")
+}
+SOURCES[EN.name] = uncomment(EN.read_text(encoding="utf-8"))
 DEFINES = {}
 for source in SOURCES.values():
     DEFINES.update(re.findall(r"^#define\s+(\w+)[ \t]+([^\n]+)", source, re.M))
@@ -193,6 +196,7 @@ class PonFixTests(unittest.TestCase):
             "en7572_prepare", "en7572_set_tx_enable",
             "airoha_xpon_xgpon_reset_and_enable_digital_rx",
             "airoha_xpon_xgpon_start_control",
+            "airoha_xpon_send_registration",
         ):
             with self.subTest(function=name):
                 tree(name)
@@ -249,6 +253,13 @@ class PonFixTests(unittest.TestCase):
         self.assertLess(enable.index("mutex_lock"), enable.index("!en->prepared"))
         self.assertNotIn("queue_delayed_work(", function("airoha_xpon_xgpon_phy_irq"))
         self.assertIn("mod_delayed_work(", function("airoha_xpon_xgpon_phy_irq"))
+        registration = function("airoha_xpon_send_registration")
+        self.assertIn("AIROHA_XGPON_CUR_KIDX", registration)
+        self.assertIn("diagnostic->control_key_index = message[3]", registration)
+        self.assertIn("AIROHA_XGPON_TX_PLOAMU_CNT", registration)
+        handler = function("airoha_xpon_handle_ploamd")
+        self.assertIn(".ploamu_tx_at_deactivate", handler)
+        self.assertIn(".irq_at_deactivate", handler)
 
     def test_tx_enable_requires_prepared_and_reports_gate_errors(self):
         for prepared in (False, True):

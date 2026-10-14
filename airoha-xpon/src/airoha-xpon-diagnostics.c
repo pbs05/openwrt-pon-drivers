@@ -599,6 +599,7 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 {
 	struct airoha_xpon *xpon = m->private;
 	struct airoha_xpon_ranging_diagnostic ranging = {};
+	struct airoha_xpon_registration_diagnostic registration = {};
 	unsigned long flags;
 	bool epon;
 
@@ -671,6 +672,7 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           READ_ONCE(xpon->stats.ploamu_blocked));
 		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
 		ranging = xpon->ranging_diagnostic;
+		registration = xpon->registration_diagnostic;
 		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
 		seq_printf(m,
 		           "ranging_diagnostic_valid: %u\n"
@@ -710,6 +712,50 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           ranging.fifo_after_ack, ranging.tx_late_errors,
 		           ranging.tx_resyncs, ranging.tx_resync_failures,
 		           ranging.ploamu_blocked);
+		seq_printf(
+			m,
+			"registration_diagnostic_valid: %u\n"
+			"registration_requests: %u\n"
+			"registration_submit_successes: %u\n"
+			"registration_submit_failures: %u\n"
+			"registration_seq: %u\n"
+			"registration_key_index: 0x%08x\n"
+			"registration_control_key_index: %u\n"
+			"registration_submit_result: %d\n"
+			"registration_fifo_before: 0x%08x\n"
+			"registration_fifo_before_overrun: %u\n"
+			"registration_fifo_before_avail: %u\n"
+			"registration_fifo_after: 0x%08x\n"
+			"registration_fifo_after_overrun: %u\n"
+			"registration_fifo_after_avail: %u\n"
+			"registration_ploamu_tx_before: %u\n"
+			"registration_ploamu_tx_after: %u\n"
+			"registration_irq_before: %u\n"
+			"registration_pending: %u\n"
+			"registration_deactivated: %u\n"
+			"registration_deactivate_ms: %u\n"
+			"registration_ploamu_tx_at_deactivate: %u\n"
+			"registration_irq_at_deactivate: %u\n",
+			registration.valid, registration.request_count,
+			registration.submit_successes,
+			registration.submit_failures, registration.seq,
+			registration.key_index, registration.control_key_index,
+			registration.submit_result, registration.fifo_before,
+			!!(registration.fifo_before &
+			   AIROHA_XGPON_PLOAMU_FIFO_OVERRUN),
+			FIELD_GET(AIROHA_XGPON_PLOAMU_FIFO_AVAIL_MASK,
+			          registration.fifo_before),
+			registration.fifo_after,
+			!!(registration.fifo_after &
+			   AIROHA_XGPON_PLOAMU_FIFO_OVERRUN),
+			FIELD_GET(AIROHA_XGPON_PLOAMU_FIFO_AVAIL_MASK,
+			          registration.fifo_after),
+			registration.ploamu_tx_before,
+			registration.ploamu_tx_after, registration.irq_before,
+			registration.pending, registration.deactivated,
+			registration.deactivate_ms,
+			registration.ploamu_tx_at_deactivate,
+			registration.irq_at_deactivate);
 	}
 	mutex_unlock(&xpon->state_lock);
 	return 0;

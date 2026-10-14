@@ -189,6 +189,28 @@ struct airoha_xpon_ranging_diagnostic {
 	bool valid;
 };
 
+struct airoha_xpon_registration_diagnostic {
+	u32 key_index;
+	u32 fifo_before;
+	u32 fifo_after;
+	u32 ploamu_tx_before;
+	u32 ploamu_tx_after;
+	u32 ploamu_tx_at_deactivate;
+	unsigned int request_count;
+	unsigned int submit_successes;
+	unsigned int submit_failures;
+	unsigned int irq_before;
+	unsigned int irq_at_deactivate;
+	unsigned long request_jiffies;
+	unsigned int deactivate_ms;
+	int submit_result;
+	u8 seq;
+	u8 control_key_index;
+	bool pending;
+	bool deactivated;
+	bool valid;
+};
+
 struct airoha_xpon_identity_set {
 	/* ndo_open latches pending_identity into the active line epoch. */
 	struct airoha_xpon_identity default_identity;
@@ -268,8 +290,10 @@ struct airoha_xpon {
 	struct airoha_xpon_epon epon;
 	struct airoha_xpon_stats stats;
 	struct airoha_xpon_ranging_diagnostic ranging_diagnostic;
+	struct airoha_xpon_registration_diagnostic registration_diagnostic;
 	struct mutex state_lock;
 	struct mutex ploam_lock;
+	/* Protects both activation diagnostic snapshots. */
 	spinlock_t ranging_diagnostic_lock;
 	struct work_struct start_work;
 	struct delayed_work link_work;

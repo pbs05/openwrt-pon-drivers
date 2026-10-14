@@ -2,6 +2,7 @@
 #include <linux/airoha-eth.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
 #include <linux/unaligned.h>
@@ -649,9 +650,12 @@ static int airoha_xpon_send_ack(struct airoha_xpon *xpon, u8 seq,
 	return ret;
 }
 
-static int airoha_xpon_send_registration(struct airoha_xpon *xpon, u8 seq)
+static int airoha_xpon_send_registration(
+	struct airoha_xpon *xpon, u8 seq,
+	struct airoha_xpon_registration_diagnostic *diagnostic)
 {
 	u8 message[AIROHA_XGPON_PLOAMU_BYTES] = {};
+	int ret;
 
 	message[4] = xpon->onu_id >> 8;
 	message[5] = xpon->onu_id;
@@ -661,7 +665,22 @@ static int airoha_xpon_send_registration(struct airoha_xpon *xpon, u8 seq)
 	memcpy(message + 8, xpon->identity.active_identity.registration_id,
 	       sizeof(xpon->identity.active_identity.registration_id));
 
-	return airoha_xpon_send_ploamu(xpon, message);
+	diagnostic->key_index =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+	diagnostic->control_key_index = message[3];
+	diagnostic->fifo_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic->ploamu_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic->irq_before =
+		READ_ONCE(xpon->stats.registration_sent_count);
+	ret = airoha_xpon_send_ploamu(xpon, message);
+	diagnostic->fifo_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic->ploamu_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+
+	return ret;
 }
 
 static int airoha_xpon_send_key_report(struct airoha_xpon *xpon, u8 seq,
@@ -1131,8 +1150,43 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 	case AIROHA_XGPON_PLOAMD_REQUEST_REGISTRATION:
 		if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id)
 			ret = -EINVAL;
-		else
-			ret = airoha_xpon_send_registration(xpon, message[3]);
+		else {
+			struct airoha_xpon_registration_diagnostic registration;
+			unsigned long flags;
+
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			registration = xpon->registration_diagnostic;
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                       flags);
+			registration.request_count++;
+			registration.seq = message[3];
+			registration.request_jiffies = jiffies;
+			registration.pending = true;
+			registration.deactivated = false;
+			registration.valid = true;
+			ret = airoha_xpon_send_registration(
+				xpon, message[3], &registration);
+			registration.submit_result = ret;
+			if (ret)
+				registration.submit_failures++;
+			else
+				registration.submit_successes++;
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			xpon->registration_diagnostic = registration;
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                       flags);
+			dev_info_ratelimited(
+				xpon->dev,
+				"PLOAM registration diagnostic: seq=%u key_index=0x%08x control_key_index=%u submit=%d PLOAMu_FIFO=0x%08x->0x%08x PLOAMu_TX=%u->%u registration_irq=%u\n",
+				registration.seq, registration.key_index,
+				registration.control_key_index,
+				registration.submit_result,
+				registration.fifo_before,
+				registration.fifo_after,
+				registration.ploamu_tx_before,
+				registration.ploamu_tx_after,
+				registration.irq_before);
+		}
 		if (ret == -EACCES)
 			ret = 0;
 		break;
@@ -1144,6 +1198,7 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		    dest != AIROHA_XGPON_ALL_ONU_ID)
 			ret = -EINVAL;
 		else {
+			struct airoha_xpon_registration_diagnostic registration = {};
 			unsigned long flags;
 
 			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
@@ -1155,8 +1210,35 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 						AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
 				xpon->ranging_diagnostic.deactivated = true;
 			}
+			if (xpon->registration_diagnostic.valid &&
+			    xpon->registration_diagnostic.pending &&
+			    xpon->onu_state == AIROHA_XGPON_O5) {
+				xpon->registration_diagnostic
+					.ploamu_tx_at_deactivate =
+					airoha_xgpon_read(
+						xpon,
+						AIROHA_XGPON_TX_PLOAMU_CNT);
+				xpon->registration_diagnostic.irq_at_deactivate =
+					READ_ONCE(
+						xpon->stats.registration_sent_count);
+				xpon->registration_diagnostic.deactivate_ms =
+					jiffies_to_msecs(
+						jiffies -
+						xpon->registration_diagnostic
+							.request_jiffies);
+				xpon->registration_diagnostic.pending = false;
+				xpon->registration_diagnostic.deactivated = true;
+				registration = xpon->registration_diagnostic;
+			}
 			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
 			                        flags);
+			if (registration.deactivated)
+				dev_info_ratelimited(
+					xpon->dev,
+					"PLOAM registration diagnostic: Deactivate after %u ms PLOAMu_TX=%u registration_irq=%u\n",
+					registration.deactivate_ms,
+					registration.ploamu_tx_at_deactivate,
+					registration.irq_at_deactivate);
 			/* PLAIN_RESET preserves PHY sync; link_work resets the MAC after
 			 * releasing ploam_lock.
 			 */

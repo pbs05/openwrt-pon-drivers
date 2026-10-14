@@ -224,6 +224,22 @@ Deactivate. `ranging_deactivated` indicates whether the latter sample is valid.
 A successful FIFO submission does not prove transmission or OLT acceptance;
 even an increased hardware ACK counter does not prove OLT acceptance.
 
+The same snapshot records each accepted O5 Request Registration without
+exposing the ONU serial number, Registration-ID, or keys. It includes the
+request sequence, raw current hardware key index, unchanged PLOAM control key
+index, submission result, FIFO state, PLOAMu TX counter, Registration-sent
+interrupt count, and the interval and counter values at a subsequent
+Deactivate. If both send counters advance, investigation should focus on the
+hardware-generated Registration MIC/key selection and message contents. If
+neither advances after a successful FIFO submission, investigate the HWTC
+BWmap/grant path instead.
+
+Issue [pbs05/openwrt-pon-drivers#3](https://github.com/pbs05/openwrt-pon-drivers/issues/3)
+documents an Airoha vendor path that polls `AIROHA_XGPON_TX_SYNC_READY` for up
+to 3000 us before a Ranging ACK. This branch already implements that bounded
+wait. XGS-PON-specific `RSP_TIME=0x1543` and `EqD << 2` behavior from that
+report is not applied to this 2.5G-upstream XG-PON path.
+
 挂载 debugfs 后，可在一次测距尝试后检查对应接口目录下的 `registration`
 和 `mac`。诊断快照记录最近一次初始 Ranging-Time 的 flags、EqD、EqD 写入前后
 的 TX 同步状态、有界等待结果、Ranging ACK 前后的 PLOAMu FIFO 状态及 ACK
@@ -235,3 +251,10 @@ ACK 使用当前 PLOAM 完整性密钥组；O5 中收到单播 Profile 或 Rangi
 ACK 提交前和随后 O5 收到 Deactivate 时的硬件 ACK 计数；
 `ranging_deactivated` 标明后一采样是否有效。FIFO 提交成功不等于报文已发送
 或被 OLT 接受，硬件 ACK 计数增加也不能证明 OLT 已接受。
+
+同一快照还记录 O5 Request Registration 的 seq、当前硬件 key index、
+未修改的 PLOAM control key index、提交返回值、FIFO、PLOAMu TX、
+Registration-sent 中断，以及随后 Deactivate 的间隔和计数。两个发送计数均增长
+时，重点检查硬件生成的 Registration MIC、PIK 选择和消息内容；FIFO 提交成功但
+两个计数均不增长时，优先检查 HWTC BWmap/grant 路径。诊断不输出 SN、
+Registration-ID、LOID 或密钥。
