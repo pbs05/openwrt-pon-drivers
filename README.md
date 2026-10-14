@@ -8,6 +8,72 @@ Work in progress. APIs may change substantially.
 
 开发中，API 可能发生大幅变更。
 
+**快速入口：[BWmap 兼容模式的启用、验证与关闭](#bwmap-usage)**。
+该选项**默认关闭**，升级驱动并不会自动启用。
+
+<a id="bwmap-usage"></a>
+
+## XG-PON BWmap 兼容模式：使用方法
+
+适用于已安装本分支 **xPON r74 或更新版本**的 XG-PON 线路；当前版本为 r75。
+AN7583/HWTC 上实测原厂过滤值 `0x00820000` 可让 ACK、LOID 认证和业务下发继续，
+但后续仍可能收到 OLT Deactivate，**不是保证注册成功的开关，也不是 AES 超时修复**。
+不根据 OLT 厂商自动启用，不影响 EPON；其他硬件/OLT 的效果需单独验证。
+
+### 1. 按使用的界面选择启用方式
+
+| 用户态界面 | 持久启用方式 |
+| --- | --- |
+| `luci-app-pon`，配套 `airoha-ponctl` 0.2.0-r2 / LuCI 0.1.0-r4 或更新版本 | **PON → 配置 → PON 线路 → XG-PON BWmap 兼容模式 → 原厂过滤设置（HWTC 兼容）**，保存并应用，再重启 PON 线路。 |
+| 自定义 [`luci-app-onu`（`dev` 分支）](https://github.com/rayniel/OpenWrt_ONU_CONFIG/tree/dev) | 当前没有 BWmap 开关，后端也未读取 `pon.<线路>.xgpon_stock_bwmap`；请用下面的驱动模块参数方式，不要只写 UCI。 |
+
+**自定义 ONU / 没有对应界面时：**
+
+先找到已有的模块加载条目：
+
+```sh
+grep -n 'airoha[-_]xpon' /etc/modules.d/*
+```
+
+编辑匹配文件中**已有的** `airoha-xpon` 条目，保留其他参数，添加或修改
+`xgpon_stock_bwmap=1`。例如 `/etc/modules.d/airoha-xpon` 中的该行：
+
+```text
+airoha-xpon xgpon_stock_bwmap=1
+```
+
+不要新增第二条模块加载记录，也不要在活动 PON 连接上卸载驱动。
+**模块参数需要重启设备才会重新加载**，仅在 ONU 页重启线路不足以加载修改后的模块参数。
+重启会中断网络，请自行选择维护时间。
+
+如果只想临时测试，可在驱动已加载时执行
+`echo 1 > /sys/class/net/pon0/xpon/xgpon_stock_bwmap`，
+再使用 **ONU → 诊断 → 重启 PON 线路**。这不是持久配置，驱动重载或设备重启后会丢失。
+接口不是 `pon0` 时替换为实际名称；每线路显式配置的 `0` / `1` 优先于模块默认值。
+
+### 2. 确认已作用到硬件
+
+重新启动并完成下行同步、MAC 初始化后，检查：
+
+```sh
+cat /sys/class/net/pon0/xpon/xgpon_stock_bwmap
+grep 'bwmap_check_control:' /sys/kernel/debug/airoha-xpon-pon0/mac
+```
+
+若 debugfs 尚未挂载，先执行 `mount -t debugfs debugfs /sys/kernel/debug`。
+第二条输出应为 **`bwmap_check_control: 0x00820000`**。第一条只表示暂存策略：
+`default` 表示跟随模块参数，因此模块参数启用时显示 `default` 也正常。
+仅看到 UCI 值为 `1`、模块参数为 `Y` 或界面显示 O5，都不能替代硬件读回验证。
+
+### 3. 关闭 / 回退
+
+通过 `luci-app-pon` 启用的，选择关闭或将对应 UCI 选项设为 `0`，再重启线路。
+通过模块参数持久启用的，将原条目改为 `xgpon_stock_bwmap=0` 并重启设备；
+同时确认没有每线路显式 `1` 覆盖。临时测试可写
+`echo 0 > /sys/class/net/pon0/xpon/xgpon_stock_bwmap` 后重启线路。
+`default` 是跟随模块默认值，**不等于强制关闭**。
+关闭只会恢复本次驱动加载期间启用前保存的过滤值，不能撤销上一次启动或加载驱动前的寄存器改动。
+
 ## Optical frontends / 光前端
 
 | Device / 器件 | Driver / 驱动 |
