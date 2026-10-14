@@ -15,7 +15,7 @@ Work in progress. APIs may change substantially.
 
 ## XG-PON BWmap 兼容模式：使用方法
 
-适用于已安装本分支 **xPON r74 或更新版本**的 XG-PON 线路；当前版本为 r76。
+适用于已安装本分支 **xPON r74 或更新版本**的 XG-PON 线路；当前版本为 r77。
 AN7583/HWTC 上实测原厂过滤值 `0x00820000` 可让 ACK、LOID 认证和业务下发继续，
 但后续仍可能收到 OLT Deactivate，**不是保证注册成功的开关，也不是 AES 超时修复**。
 不根据 OLT 厂商自动启用，不影响 EPON；其他硬件/OLT 的效果需单独验证。
@@ -99,7 +99,7 @@ grep 'bwmap_check_control:' /sys/kernel/debug/airoha-xpon-pon0/mac
 
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
-### Improvements informed by other drivers (xPON r76 / frontend r15)
+### Improvements informed by other drivers (xPON r77 / frontend r15)
 
 External fixes are compared and adapted, not merged as whole driver trees:
 
@@ -257,6 +257,17 @@ r76 起，O5 中 Alloc-ID 等于 ONU-ID 的 `Assign_Alloc-ID` 会直接成功确
 不会重复创建 T-CONT。硬件 T-CONT 0 本来就映射 ONU-ID，这与 Airoha vendor
 处理一致。旧实现对此直接返回错误且不发 ACK，严格的 OLT 会重发后撤销 ONU；
 不同于 ONU-ID 的 Alloc-ID 仍使用原有 T-CONT 表流程。
+
+r77 adds a bounded event snapshot for the latest accepted `Assign_Alloc-ID`.
+The `registration` debugfs file now reports the actual Alloc-ID, current ONU-ID,
+assignment type, whether it used the default shadow T-CONT, operation and ACK
+submission results, plus FIFO and PLOAMu/ACK counters before and after submission.
+No identity secrets or key material are logged.
+
+r77 增加最近一次有效 `Assign_Alloc-ID` 的事件快照：`registration` debugfs
+会直接显示实际 Alloc-ID、当前 ONU-ID、类型、是否命中默认 shadow T-CONT、
+T-CONT 操作结果、ACK 提交结果，以及提交前后的 FIFO 和 PLOAMu/ACK 计数。
+该诊断不记录身份凭据或密钥材料，也不改变协议时序。
 
 挂载 debugfs 后，可在一次测距尝试后检查对应接口目录下的 `registration`
 和 `mac`。诊断快照记录最近一次初始 Ranging-Time 的 flags、EqD、EqD 写入前后

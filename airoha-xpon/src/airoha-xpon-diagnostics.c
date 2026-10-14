@@ -600,6 +600,7 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 	struct airoha_xpon *xpon = m->private;
 	struct airoha_xpon_ranging_diagnostic ranging = {};
 	struct airoha_xpon_registration_diagnostic registration = {};
+	struct airoha_xpon_alloc_id_diagnostic alloc_id = {};
 	unsigned long flags;
 	bool epon;
 
@@ -673,6 +674,7 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
 		ranging = xpon->ranging_diagnostic;
 		registration = xpon->registration_diagnostic;
+		alloc_id = xpon->alloc_id_diagnostic;
 		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
 		seq_printf(m,
 		           "ranging_diagnostic_valid: %u\n"
@@ -781,6 +783,29 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 			registration.deactivate_ms,
 			registration.ploamu_tx_at_deactivate,
 			registration.irq_at_deactivate);
+		seq_printf(
+			m,
+			"alloc_id_diagnostic_valid: %u\n"
+			"alloc_id_seq: %u\n"
+			"alloc_id_value: %u\n"
+			"alloc_id_onu_id: %u\n"
+			"alloc_id_type: 0x%02x\n"
+			"alloc_id_default: %u\n"
+			"alloc_id_operation_result: %d\n"
+			"alloc_id_ack_result: %d\n"
+			"alloc_id_fifo_before: 0x%08x\n"
+			"alloc_id_fifo_after: 0x%08x\n"
+			"alloc_id_ploamu_tx_before: %u\n"
+			"alloc_id_ploamu_tx_after: %u\n"
+			"alloc_id_ack_tx_before: %u\n"
+			"alloc_id_ack_tx_after: %u\n",
+			alloc_id.valid, alloc_id.seq, alloc_id.alloc_id,
+			alloc_id.onu_id, alloc_id.type,
+			alloc_id.default_alloc_id, alloc_id.operation_result,
+			alloc_id.ack_result, alloc_id.fifo_before,
+			alloc_id.fifo_after, alloc_id.ploamu_tx_before,
+			alloc_id.ploamu_tx_after, alloc_id.ack_tx_before,
+			alloc_id.ack_tx_after);
 	}
 	mutex_unlock(&xpon->state_lock);
 	return 0;

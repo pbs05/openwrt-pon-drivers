@@ -113,7 +113,9 @@ rayniel-an7583-ranging-diagnostics
 当前状态：
 
 - 诊断改动提交并推送到上述审阅分支。
-- r76 默认 Alloc-ID ACK 修复已在本地完成，等待验证和推送。
+- r76 默认 Alloc-ID ACK 修复已推送，等待设备验证。
+- r77 增加实际 Alloc-ID、ONU-ID、类型、操作/ACK 结果及 FIFO/计数快照，
+  用于直接确认 HWTC 重发的是默认 Alloc-ID。
 - 未创建 Pull Request。
 - 没有生成未经验证的 `.ko`。
 

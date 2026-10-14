@@ -290,6 +290,12 @@ class PonFixTests(unittest.TestCase):
             alloc.index("if (alloc_id == xpon->onu_id)"),
             alloc.index("ack_result = airoha_xpon_send_ack("),
         )
+        self.assertIn("diagnostic.alloc_id = alloc_id;", alloc)
+        self.assertIn("diagnostic.onu_id = xpon->onu_id;", alloc)
+        self.assertIn("diagnostic.operation_result = ret;", alloc)
+        self.assertIn("diagnostic.ack_result = ack_result;", alloc)
+        self.assertIn("AIROHA_XGPON_PLOAMU_FIFO_STS", alloc)
+        self.assertIn("AIROHA_XGPON_TX_ACK_PLOAMU_CNT", alloc)
 
     def test_tx_enable_requires_prepared_and_reports_gate_errors(self):
         for prepared in (False, True):

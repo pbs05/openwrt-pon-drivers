@@ -224,6 +224,23 @@ struct airoha_xpon_registration_diagnostic {
 	bool valid;
 };
 
+struct airoha_xpon_alloc_id_diagnostic {
+	u32 fifo_before;
+	u32 fifo_after;
+	u32 ploamu_tx_before;
+	u32 ploamu_tx_after;
+	u32 ack_tx_before;
+	u32 ack_tx_after;
+	u16 alloc_id;
+	u16 onu_id;
+	int operation_result;
+	int ack_result;
+	u8 seq;
+	u8 type;
+	bool default_alloc_id;
+	bool valid;
+};
+
 struct airoha_xpon_identity_set {
 	/* ndo_open latches pending_identity into the active line epoch. */
 	struct airoha_xpon_identity default_identity;
@@ -304,9 +321,10 @@ struct airoha_xpon {
 	struct airoha_xpon_stats stats;
 	struct airoha_xpon_ranging_diagnostic ranging_diagnostic;
 	struct airoha_xpon_registration_diagnostic registration_diagnostic;
+	struct airoha_xpon_alloc_id_diagnostic alloc_id_diagnostic;
 	struct mutex state_lock;
 	struct mutex ploam_lock;
-	/* Protects both activation diagnostic snapshots. */
+	/* Protects the activation diagnostic snapshots. */
 	spinlock_t ranging_diagnostic_lock;
 	struct work_struct start_work;
 	struct delayed_work link_work;

@@ -1114,6 +1114,8 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
                                        const u8 *message)
 {
+	struct airoha_xpon_alloc_id_diagnostic diagnostic = {};
+	unsigned long flags;
 	u16 dest = get_unaligned_be16(message);
 	u16 alloc_id = (message[4] & 0x3f) << 8 | message[5];
 	u8 type = message[6];
@@ -1122,6 +1124,18 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id)
 		return -EINVAL;
+
+	diagnostic.seq = message[3];
+	diagnostic.alloc_id = alloc_id;
+	diagnostic.onu_id = xpon->onu_id;
+	diagnostic.type = type;
+	diagnostic.default_alloc_id = alloc_id == xpon->onu_id;
+	diagnostic.fifo_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic.ploamu_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic.ack_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
 
 	/*
 	 * T-CONT 0 shadows ONU-ID. The vendor path acknowledges this default
@@ -1139,6 +1153,27 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	ack_result = airoha_xpon_send_ack(
 		xpon, message[3], ret ? AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR :
 		                       AIROHA_XGPON_PLOAM_ACK_OK);
+	diagnostic.operation_result = ret;
+	diagnostic.ack_result = ack_result;
+	diagnostic.fifo_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic.ploamu_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic.ack_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+	diagnostic.valid = true;
+	spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+	xpon->alloc_id_diagnostic = diagnostic;
+	spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+	dev_info_ratelimited(
+		xpon->dev,
+		"PLOAM Alloc-ID diagnostic: seq=%u alloc_id=%u onu_id=%u type=0x%02x default=%u operation=%d ACK=%d PLOAMu_FIFO=0x%08x->0x%08x PLOAMu_TX=%u->%u ACK_TX=%u->%u\n",
+		diagnostic.seq, diagnostic.alloc_id, diagnostic.onu_id,
+		diagnostic.type, diagnostic.default_alloc_id,
+		diagnostic.operation_result, diagnostic.ack_result,
+		diagnostic.fifo_before, diagnostic.fifo_after,
+		diagnostic.ploamu_tx_before, diagnostic.ploamu_tx_after,
+		diagnostic.ack_tx_before, diagnostic.ack_tx_after);
 	/* link_work applies pending mappings after the FIFO lock is released. */
 	if (!ret && type == 1 && READ_ONCE(xpon->data_path.pending_count))
 		atomic_set(&xpon->data_path_retry_pending, 1);
