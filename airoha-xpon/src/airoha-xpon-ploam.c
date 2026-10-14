@@ -994,9 +994,11 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		diagnostic.tx_sync_after =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
 		/*
-		 * The TX timing update must settle before entering O5 or sending
-		 * the Ranging ACK. The threaded IRQ can sleep during this bound.
+		 * The vendor path enters O5 before checking TX timing readiness.
+		 * ACTIVATION_ST can change the upstream timing state, so an O4
+		 * ready sample does not prove that the first O5 grant is usable.
 		 */
+		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
 		ret = readl_poll_timeout(
 			xpon->xgpon_base + AIROHA_XGPON_DBG_RESYNC,
 			diagnostic.tx_sync_after_wait,
@@ -1014,7 +1016,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 				"absolute=%u positive=%u EqD=0x%08x "
 				"TX_SYNC_READY=%u->%u->%u wait=%d "
 				"ACK=not-attempted PLOAMu_FIFO=0x%08x; "
-				"stayed in O4\n",
+				"entered O5 without ACK\n",
 				diagnostic.flags, diagnostic.absolute,
 				diagnostic.positive, diagnostic.eqd,
 				!!(diagnostic.tx_sync_before &
@@ -1043,12 +1045,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
 		diagnostic.ack_tx_before =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
-		/*
-		 * Match the vendor activation order: enter O5 and submit the
-		 * Ranging ACK before OMCI and data-path notifications can delay
-		 * FIFO submission beyond the first O5 PLOAMu grant.
-		 */
-		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
+		/* Submit before link notifications can delay the first O5 grant. */
 		ack_result = airoha_xpon_send_ack(
 			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
 		diagnostic.ack_attempted = true;

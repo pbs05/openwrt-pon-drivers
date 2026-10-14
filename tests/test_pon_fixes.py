@@ -265,6 +265,10 @@ class PonFixTests(unittest.TestCase):
         self.assertIn("AIROHA_XGPON_US_PROF_VLD", ranging)
         self.assertLess(
             ranging.index("airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5)"),
+            ranging.index("ret = readl_poll_timeout("),
+        )
+        self.assertLess(
+            ranging.index("ret = readl_poll_timeout("),
             ranging.index("ack_result = airoha_xpon_send_ack("),
         )
         self.assertLess(

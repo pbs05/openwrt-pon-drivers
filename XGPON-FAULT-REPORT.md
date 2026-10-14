@@ -163,10 +163,11 @@ PLOAMu_TX=... registration_irq=...
 
 后续 vendor 顺序对照补丁有意调整了一处行为：
 
-- 首次 O4 Ranging-Time 写入 EqD、等待 `TX_SYNC_READY` 并进入 O5 后，立即
-  提交 Ranging ACK；OMCI link 和数据路径通知移到 ACK 提交之后。该顺序与
-  vendor 的“进入 O5 → 高优先级 Ranging ACK tasklet → OMCI/event”一致，
-  用于避免 ACK FIFO 提交晚于 HWTC 的首个 O5 PLOAMu grant。
+- 首次 O4 Ranging-Time 写入 EqD 后先进入 O5，再等待 `TX_SYNC_READY` 并
+  立即提交 Ranging ACK；OMCI link 和数据路径通知移到 ACK 提交之后。该顺序
+  与 vendor 的“进入 O5 → Ranging ACK tasklet 中等待 ready → 提交 ACK →
+  OMCI/event”一致。旧实现的 ready 采样全部发生在 O5 状态写入之前，不能证明
+  O5 切换后的首个上行 grant 已 ready。
 
 ## 已完成验证
 
@@ -225,6 +226,12 @@ dmesg | grep -E \
 
 ## 诊断结果判读
 
+- 2026-10-14 刷入事件级诊断后的 HWTC 实测：
+  `US_PROF_VLD=0x31313131`，`TX_ERR_STS=0`，ACK 提交返回 0，但
+  `TX_PLOAMU_CNT=209→209→209`、`TX_ACK_PLOAMU_CNT=9→9→9`
+  （ACK 前、ACK 后、Deactivate 时）。这证明 ACK 已写 FIFO但未实际发送，
+  故障位于 O5 切换后的 TX-ready/PLOAMu grant 窗口，而不是 OLT 收到 ACK
+  后因 MIC、PIK 或 Burst Profile 拒绝。
 - `TX_SYNC_READY=1->1`：EqD 写前后 ready 均未下降。
 - `TX_SYNC_READY=1->0`：强烈支持 EqD 写入后需要等待 TX timing ready。
 - `ACK=0`：ACK 已成功提交给 PLOAMu FIFO，不代表 OLT 一定收到。

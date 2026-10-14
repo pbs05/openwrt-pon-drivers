@@ -211,10 +211,10 @@ With debugfs mounted, inspect
 ranging attempt. The registration snapshot records the latest initial
 Ranging-Time flags, EqD, TX synchronization state before and after the EqD
 write, the bounded TX-ready wait result, PLOAMu FIFO state around the Ranging
-ACK, and the ACK submission result. The driver waits up to 3000 us for TX
-synchronization before entering O5 and submitting the initial Ranging ACK. If
-the wait expires, it leaves the ONU in O4, does not submit the ACK, and records
-the timeout. After entering O5, the driver submits the Ranging ACK before OMCI
+ACK, and the ACK submission result. Following the Airoha vendor sequence, the
+driver writes EqD, enters O5, then waits up to 3000 us for TX synchronization
+before submitting the initial Ranging ACK. If the wait expires, it records the
+O5 timeout and does not submit the ACK. The driver submits the Ranging ACK before OMCI
 or data-path notifications, matching the Airoha vendor activation order and
 avoiding delayed FIFO submission beyond the first O5 PLOAMu grant. ACKs select the current PLOAM
 integrity-key group, and directed
@@ -248,9 +248,9 @@ report is not applied to this 2.5G-upstream XG-PON path.
 挂载 debugfs 后，可在一次测距尝试后检查对应接口目录下的 `registration`
 和 `mac`。诊断快照记录最近一次初始 Ranging-Time 的 flags、EqD、EqD 写入前后
 的 TX 同步状态、有界等待结果、Ranging ACK 前后的 PLOAMu FIFO 状态及 ACK
-提交结果，并显示 TX late 与重新同步计数。驱动在进入 O5 和提交首次 Ranging
-ACK 前最多等待 TX 同步 3000 微秒；超时则保持 O4、不提交 ACK，并记录超时。
-进入 O5 后，驱动先提交 Ranging ACK，再更新 OMCI 和数据路径通知，与 Airoha
+提交结果，并显示 TX late 与重新同步计数。按照 Airoha vendor 顺序，驱动先写
+EqD、进入 O5，再最多等待 TX 同步 3000 微秒后提交首次 Ranging ACK；超时则
+记录 O5 ready timeout 且不提交 ACK。驱动先提交 Ranging ACK，再更新 OMCI 和数据路径通知，与 Airoha
 vendor 激活顺序一致，避免 FIFO 提交晚于首个 O5 PLOAMu grant。ACK 使用当前 PLOAM
 完整性密钥组；O5 中收到单播 Profile 或 Ranging-Time
 （包括重发）也会回 ACK。ACK 提交失败会记录错误，不再计入成功处理消息。
