@@ -1037,6 +1037,16 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
 		diagnostic.ack_key_index =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+		diagnostic.activation_reply_control = airoha_xgpon_read(
+			xpon, AIROHA_XGPON_O23_O4_PLOAMU_CTRL);
+		diagnostic.us_profile_valid_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_US_PROF_VLD);
+		diagnostic.bwm_check_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+		diagnostic.tx_error_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
+		diagnostic.ploamu_tx_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
 		diagnostic.ack_tx_before =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
 		ack_result = airoha_xpon_send_ack(
@@ -1045,12 +1055,20 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		diagnostic.ack_result = ack_result;
 		diagnostic.fifo_after_ack =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		diagnostic.ploamu_tx_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+		diagnostic.ack_tx_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+		diagnostic.bwm_check_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+		diagnostic.tx_error_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
 		airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
 		dev_info(
 			xpon->dev,
 			"PLOAM ranging diagnostic: flags=0x%02x absolute=%u "
 			"positive=%u EqD=0x%08x TX_SYNC_READY=%u->%u->%u "
-			"wait=%d ACK=%d "
+			"wait=%d ACK=%d PLOAMu_TX=%u->%u ACK_TX=%u->%u "
 			"PLOAMu_FIFO=0x%08x->0x%08x tx_late=%u tx_resync=%u "
 			"tx_resync_failed=%u blocked=%u; entered O5; "
 			"service GEM/T-CONT mapping is still required\n",
@@ -1063,7 +1081,9 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			!!(diagnostic.tx_sync_after_wait &
 			   AIROHA_XGPON_TX_SYNC_READY),
 			diagnostic.tx_sync_wait_result,
-			diagnostic.ack_result, diagnostic.fifo_before_ack,
+			diagnostic.ack_result, diagnostic.ploamu_tx_before,
+			diagnostic.ploamu_tx_after, diagnostic.ack_tx_before,
+			diagnostic.ack_tx_after, diagnostic.fifo_before_ack,
 			diagnostic.fifo_after_ack, diagnostic.tx_late_errors,
 			diagnostic.tx_resyncs, diagnostic.tx_resync_failures,
 			diagnostic.ploamu_blocked);
@@ -1199,15 +1219,37 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 			ret = -EINVAL;
 		else {
 			struct airoha_xpon_registration_diagnostic registration = {};
+			u32 ack_tx_at_deactivate;
+			u32 bwm_check_at_deactivate;
+			u32 ploamu_tx_at_deactivate;
+			u32 tx_error_at_deactivate;
+			u32 us_profile_valid_at_deactivate;
 			unsigned long flags;
 
+			ploamu_tx_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+			ack_tx_at_deactivate = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+			us_profile_valid_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_US_PROF_VLD);
+			bwm_check_at_deactivate = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+			tx_error_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
 			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
 			if (xpon->ranging_diagnostic.valid &&
 			    xpon->onu_state == AIROHA_XGPON_O5) {
 				xpon->ranging_diagnostic.ack_tx_at_deactivate =
-					airoha_xgpon_read(
-						xpon,
-						AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+					ack_tx_at_deactivate;
+				xpon->ranging_diagnostic.ploamu_tx_at_deactivate =
+					ploamu_tx_at_deactivate;
+				xpon->ranging_diagnostic
+					.us_profile_valid_at_deactivate =
+					us_profile_valid_at_deactivate;
+				xpon->ranging_diagnostic.bwm_check_at_deactivate =
+					bwm_check_at_deactivate;
+				xpon->ranging_diagnostic.tx_error_at_deactivate =
+					tx_error_at_deactivate;
 				xpon->ranging_diagnostic.deactivated = true;
 			}
 			if (xpon->registration_diagnostic.valid &&
@@ -1215,9 +1257,7 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 			    xpon->onu_state == AIROHA_XGPON_O5) {
 				xpon->registration_diagnostic
 					.ploamu_tx_at_deactivate =
-					airoha_xgpon_read(
-						xpon,
-						AIROHA_XGPON_TX_PLOAMU_CNT);
+					ploamu_tx_at_deactivate;
 				xpon->registration_diagnostic.irq_at_deactivate =
 					READ_ONCE(
 						xpon->stats.registration_sent_count);

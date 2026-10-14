@@ -257,8 +257,16 @@ class PonFixTests(unittest.TestCase):
         self.assertIn("AIROHA_XGPON_CUR_KIDX", registration)
         self.assertIn("diagnostic->control_key_index = message[3]", registration)
         self.assertIn("AIROHA_XGPON_TX_PLOAMU_CNT", registration)
+        ranging = function("airoha_xpon_accept_ranging_time")
+        self.assertIn("diagnostic.ploamu_tx_before", ranging)
+        self.assertIn("diagnostic.ploamu_tx_after", ranging)
+        self.assertIn("AIROHA_XGPON_DBG_BWM_CHK_STS", ranging)
+        self.assertIn("AIROHA_XGPON_TX_ERR_STS", ranging)
+        self.assertIn("AIROHA_XGPON_US_PROF_VLD", ranging)
         handler = function("airoha_xpon_handle_ploamd")
         self.assertIn(".ploamu_tx_at_deactivate", handler)
+        self.assertIn(".bwm_check_at_deactivate", handler)
+        self.assertIn(".tx_error_at_deactivate", handler)
         self.assertIn(".irq_at_deactivate", handler)
 
     def test_tx_enable_requires_prepared_and_reports_gate_errors(self):

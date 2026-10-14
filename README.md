@@ -219,10 +219,12 @@ Profile and Ranging-Time messages in O5 are acknowledged, including retries.
 ACK submission failures are reported instead of being counted as accepted
 messages. The snapshot also exposes TX-late and resynchronization counters,
 hardware Registration send events, the key index sampled before the initial
-ACK, and the hardware ACK counter before submission and at a subsequent O5
-Deactivate. `ranging_deactivated` indicates whether the latter sample is valid.
-A successful FIFO submission does not prove transmission or OLT acceptance;
-even an increased hardware ACK counter does not prove OLT acceptance.
+ACK, total PLOAMu and ACK counters before/after submission and at a subsequent
+O5 Deactivate, the O2/O4 reply-control value, upstream profile-valid bitmap,
+BWmap-check status, and TX-error status. `ranging_deactivated` indicates
+whether the Deactivate samples are valid. A successful FIFO submission does
+not prove transmission or OLT acceptance; even an increased hardware ACK
+counter does not prove OLT acceptance.
 
 The same snapshot records each accepted O5 Request Registration without
 exposing the ONU serial number, Registration-ID, or keys. It includes the
@@ -248,9 +250,10 @@ ACK 前最多等待 TX 同步 3000 微秒；超时则保持 O4、不提交 ACK�
 ACK 使用当前 PLOAM 完整性密钥组；O5 中收到单播 Profile 或 Ranging-Time
 （包括重发）也会回 ACK。ACK 提交失败会记录错误，不再计入成功处理消息。
 快照还显示硬件 Registration 发送事件计数、首次 ACK 前的密钥索引，以及
-ACK 提交前和随后 O5 收到 Deactivate 时的硬件 ACK 计数；
-`ranging_deactivated` 标明后一采样是否有效。FIFO 提交成功不等于报文已发送
-或被 OLT 接受，硬件 ACK 计数增加也不能证明 OLT 已接受。
+ACK 提交前后和随后 O5 收到 Deactivate 时的总 PLOAMu/ACK 计数，以及
+O2/O4 回复控制值、上行 profile-valid 位图、BWmap 检查和 TX error 状态；
+`ranging_deactivated` 标明 Deactivate 采样是否有效。FIFO 提交成功不等于
+报文已发送或被 OLT 接受，硬件 ACK 计数增加也不能证明 OLT 已接受。
 
 同一快照还记录 O5 Request Registration 的 seq、当前硬件 key index、
 未修改的 PLOAM control key index、提交返回值、FIFO、PLOAMu TX、

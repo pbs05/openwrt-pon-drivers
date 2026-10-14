@@ -124,6 +124,10 @@ rayniel-an7583-ranging-diagnostics
 - Ranging ACK 的真实返回值。
 - ACK 提交使用的 PLOAMu FIFO 状态。
 - ACK 提交后的 PLOAMu FIFO 状态。
+- ACK 提交前后及 Deactivate 时的总 PLOAMu TX 和 ACK TX 计数。
+- O2/O4 回复控制值。
+- ACK 前及 Deactivate 时的上行 Burst Profile valid 位图。
+- ACK 前后及 Deactivate 时的 BWmap 检查和 TX error 状态。
 - FIFO raw、valid、overrun 和 available words。
 - TX late、resync、resync failure 和 PLOAMu blocked 当前计数。
 - 上述计数在最近一次首次测距事件中的快照。
@@ -137,7 +141,8 @@ rayniel-an7583-ranging-diagnostics
 
 ```text
 PLOAM ranging diagnostic: flags=... absolute=... positive=... EqD=...
-TX_SYNC_READY=x->y ACK=... PLOAMu_FIFO=before->after
+TX_SYNC_READY=x->y ACK=... PLOAMu_TX=before->after ACK_TX=before->after
+PLOAMu_FIFO=before->after
 tx_late=... tx_resync=... tx_resync_failed=... blocked=...
 PLOAM registration diagnostic: seq=... key_index=... submit=...
 PLOAMu_FIFO=before->after PLOAMu_TX=before->after registration_irq=...
@@ -221,6 +226,14 @@ dmesg | grep -E \
 - `ACK=-28`：`-ENOSPC`，PLOAMu FIFO 可用空间不足。
 - `ACK=-75`：`-EOVERFLOW`，PLOAMu FIFO overrun。
 - ACK 为 0 但 FIFO 长期不恢复：支持 ACK 已入 FIFO但没有正常发送。
+- 总 PLOAMu TX 和 ACK TX 在提交后至 Deactivate 均不增长：支持软件 ACK
+  没有获得可用上行 PLOAMu grant。
+- 总 PLOAMu TX 增长而 ACK TX 不增长：先核实 ACK 专用计数器语义，不能仅凭
+  该计数断定 ACK 未发送。
+- `ranging_tx_error_at_deactivate & 0x4` 且 profile-valid 位图在 ACK 前已缺位：
+  支持 Burst Profile 未正确生效；若只在 Deactivate 时出现，可能是清表时序。
+- `ranging_bwmap_status_at_deactivate & 0x1` 表示 minimum burst interval
+  异常；需结合 ACK 前后快照判断是否与本次 grant 同步发生。
 - 首次测距后 TX late/resync 计数立即增长：支持首个 burst 时序错误。
 - ready 正常、ACK 成功、FIFO 正常且无 TX late：需要转向 Burst Profile、
   protection-path flags 或 OLT 侧策略继续分析。

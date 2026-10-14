@@ -687,7 +687,20 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           "ranging_ack_attempted: %u\n"
 		           "ranging_ack_result: %d\n"
 		           "ranging_ack_key_index: 0x%08x\n"
+		           "ranging_activation_reply_control: 0x%08x\n"
+		           "ranging_us_profile_valid_before_ack: 0x%08x\n"
+		           "ranging_us_profile_valid_at_deactivate: 0x%08x\n"
+		           "ranging_bwmap_status_before_ack: 0x%08x\n"
+		           "ranging_bwmap_status_after_ack: 0x%08x\n"
+		           "ranging_bwmap_status_at_deactivate: 0x%08x\n"
+		           "ranging_tx_error_before_ack: 0x%08x\n"
+		           "ranging_tx_error_after_ack: 0x%08x\n"
+		           "ranging_tx_error_at_deactivate: 0x%08x\n"
+		           "ranging_ploamu_tx_before: %u\n"
+		           "ranging_ploamu_tx_after: %u\n"
+		           "ranging_ploamu_tx_at_deactivate: %u\n"
 		           "ranging_ack_tx_before: %u\n"
+		           "ranging_ack_tx_after: %u\n"
 		           "ranging_deactivated: %u\n"
 		           "ranging_ack_tx_at_deactivate: %u\n"
 		           "ranging_ploamu_fifo_before_ack: 0x%08x\n"
@@ -707,7 +720,19 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           ranging.tx_sync_wait_result,
 		           ranging.ack_attempted,
 		           ranging.ack_result, ranging.ack_key_index,
-		           ranging.ack_tx_before, ranging.deactivated,
+		           ranging.activation_reply_control,
+		           ranging.us_profile_valid_before_ack,
+		           ranging.us_profile_valid_at_deactivate,
+		           ranging.bwm_check_before_ack,
+		           ranging.bwm_check_after_ack,
+		           ranging.bwm_check_at_deactivate,
+		           ranging.tx_error_before_ack,
+		           ranging.tx_error_after_ack,
+		           ranging.tx_error_at_deactivate,
+		           ranging.ploamu_tx_before, ranging.ploamu_tx_after,
+		           ranging.ploamu_tx_at_deactivate,
+		           ranging.ack_tx_before, ranging.ack_tx_after,
+		           ranging.deactivated,
 		           ranging.ack_tx_at_deactivate, ranging.fifo_before_ack,
 		           ranging.fifo_after_ack, ranging.tx_late_errors,
 		           ranging.tx_resyncs, ranging.tx_resync_failures,
