@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 XPON = ROOT / "airoha-xpon/src"
 EN = ROOT / "airoha-pon-frontends/src/airoha-en7572.c"
 PARSER = c_parser.CParser()
-TYPES = ("typedef int bool; typedef unsigned char u8;"
+TYPES = ("typedef int bool; typedef unsigned char u8; typedef unsigned short u16;"
          "typedef unsigned int u32; typedef int irqreturn_t;")
 
 
@@ -280,6 +280,16 @@ class PonFixTests(unittest.TestCase):
         self.assertIn(".bwm_check_at_deactivate", handler)
         self.assertIn(".tx_error_at_deactivate", handler)
         self.assertIn(".irq_at_deactivate", handler)
+        alloc = function("airoha_xpon_accept_alloc_id")
+        self.assertNotIn(
+            "alloc_id == xpon->onu_id)",
+            alloc[:alloc.index("return -EINVAL;")],
+        )
+        self.assertIn("if (alloc_id == xpon->onu_id)\n\t\tret = 0;", alloc)
+        self.assertLess(
+            alloc.index("if (alloc_id == xpon->onu_id)"),
+            alloc.index("ack_result = airoha_xpon_send_ack("),
+        )
 
     def test_tx_enable_requires_prepared_and_reports_gate_errors(self):
         for prepared in (False, True):

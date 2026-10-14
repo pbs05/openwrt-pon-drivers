@@ -24,9 +24,9 @@ Registration-ID 内容或密钥。
 
 | # | 故障或现象 | 已取得证据 | 当前判断 | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | XG-PON 激活循环，无法稳定上线 | 稳定重复 `O2_3 → O4 → O5 → Deactivate → O2_3`；通常在 Registration 回复后约 80–110 ms 被 OLT Deactivate | 主故障发生在首次测距完成后的 Registration 阶段 | 未解决，测距诊断已完成，转向 Registration 专项诊断 |
+| 1 | XG-PON 激活循环，无法稳定上线 | 稳定重复 `O2_3 → O4 → O5 → Deactivate → O2_3`；最新固件至少一次在 O5 收到三次 `Assign Alloc-ID 0x0a` 后被撤销 | 当前最高可信故障点是默认 Alloc-ID ACK 缺失 | 已修复源码，等待设备验证 |
 | 2 | OMCI 完全未建立 | OMCI 收发计数持续为 0，密钥交换也未开始 | 不是 OMCI 配置协商失败，而是 OLT 在 OMCI 之前已撤销 ONU | 已确认是主故障的结果，不是首要根因 |
-| 3 | OLT 下发流程在 Registration 后终止 | 已观察到 `Profile(0x01) → Assign ONU-ID(0x03) → Ranging-Time(0x04) → Request Registration(0x09) → Deactivate(0x05)`；驱动确实提交了 Registration 回复 | 问题已从首次测距收窄到 Registration PLOAM 的实际发送、硬件 MIC/PIK 选择或报文内容 | 当前最高可信根因区间 |
+| 3 | OLT 下发流程在 O5 中终止 | 历史周期曾进入 Request Registration；最新周期中 HWTC 三次重发 `Assign Alloc-ID 0x0a` 后 Deactivate | 若该 Alloc-ID 等于 ONU-ID，旧驱动直接拒绝且不发 ACK；vendor 会用 shadow T-CONT 0 并 ACK OK | 已按 vendor 行为修复 |
 | 4 | 首次 Ranging ACK 可能早于 TX 时序同步完成 | 上机诊断显示 EqD 写前、写后和 ACK 阶段 `TX_SYNC_READY=1`，ACK 返回 0 | 本机样本不支持 ACK 等待假设；Issue #3 的 vendor 等待仍是有效外部证据，但不是当前首要方向 | 已基本排除 |
 | 5 | Ranging ACK 返回值原先被忽略 | `airoha_xpon_send_ack()` 返回值未被记录；TX gate 关闭、FIFO overrun、空间不足均不可观察 | 即使 ACK 没有成功提交，旧日志也可能表现为已经进入 O5 | 已在本地诊断补丁中修复不可观察问题，不改变协议行为 |
 | 6 | PLOAMu FIFO 可能堵塞或空间不足 | 上机诊断显示 FIFO 无 overrun、可用空间充足，Ranging ACK 提交成功 | 首次测距 ACK 没有卡在 FIFO；Registration 仍需独立采集提交和发送计数 | 测距路径已排除，已增加 Registration FIFO 快照 |
@@ -41,7 +41,7 @@ Registration-ID 内容或密钥。
 | 15 | `RSP_TIME`/EqD 无运行时安全调节入口 | 当前 XG-PON 驱动使用 `RSP_TIME=0x551`，约对应 2.5G 上行 35 µs；没有 UCI/`ponctl` 开关 | 不应直接用 `devmem` 修改；Issue #3 的 XGS `0x1543` 和 `EqD << 2` 不适用于本机 XG-PON | 保持原值，诊断轮不做行为改变 |
 | 16 | Registration 专项诊断尚未在目标内核运行 | 当前工作区仍无匹配 OpenWrt SDK、kernel build tree 或工具链；设备现有固件已包含较完整的测距诊断，但不含本次新增的 Registration 快照 | 不能在本机安全产出与 `6.18.52` 匹配的 `.ko`，也不能提供未经验证的二进制 | 需要在匹配的 PonWrt 构建环境编译 |
 | 17 | 成功 ONU 基准已经建立 | 中兴 ZXHN F7015TV3 重启后稳定 O5/Registered，`LoidState=1`，OMCI、PLOAM 和业务 GEM 均正常；使用与 PonWrt 相同的 LOID/Registration-ID、不同 SN | 光路、OLT 端口及凭据组合可用，故障集中在 PonWrt/AN7583 Registration 实现 | 已确认 |
-| 18 | Registration PLOAM 的 MIC/密钥或格式可能异常 | 中兴成功路径会对方向字节和 40 字节 Registration 内容生成 activation PLOAM MIC 后再发送；AN7583 使用 44 字节硬件控制/FIFO 格式，由 MAC 生成 MIC | 需要确认 AN7583 当前 PIK index、硬件发送计数和 Registration-sent IRQ 是否在 Deactivate 前增长 | 当前最高优先级假设 |
+| 18 | Registration PLOAM 的 MIC/密钥或格式可能异常 | 中兴成功路径会对方向字节和 40 字节 Registration 内容生成 activation PLOAM MIC 后再发送；AN7583 使用 44 字节硬件控制/FIFO 格式，由 MAC 生成 MIC | 密钥寄存器顺序已与 vendor setter/getter 对照一致；仅在默认 Alloc-ID ACK 修复后仍失败时继续追查 | 次级假设 |
 
 ## 已排除或基本排除的项目
 
@@ -57,16 +57,24 @@ Registration-ID 内容或密钥。
 
 ## 当前最高可信根因
 
-当前最可疑的根因已经收窄为 Registration PLOAM：
+最新周期暴露了一个可直接证明的 vendor 行为差异：
 
-1. 首次绝对 Ranging-Time 的 EqD、`TX_SYNC_READY`、ACK 返回、FIFO 和
-   TX late/resync/blocked 诊断均正常。
-2. OLT 随后下发 Request Registration。
-3. AN7583 驱动向 11-word PLOAMu FIFO 提交 44 字节控制块；Registration
-   的 MIC 由 MAC 使用当前 PIK 生成，而不是由软件附加。
-4. OLT 在 Registration 回复后约 80–110 ms Deactivate，OMCI 仍为 0。
-5. 因此需要判断该回复是否真正上光，以及硬件选用的 PIK index、MIC
-   和 36 字节 Registration-ID 内容是否符合 OLT 预期。
+1. 首次 Ranging ACK 已在 O5 后、`TX_SYNC_READY=1` 时成功入 FIFO，随后
+   `TX_PLOAMU_CNT` 和 `TX_ACK_PLOAMU_CNT` 均增长，不能再判断为完全未发送。
+2. HWTC 随后至少一次连续三次下发 `Assign Alloc-ID 0x0a`，但没有继续建立
+   OMCI，最终 Deactivate。
+3. 驱动自身已注明 T-CONT 0 shadow ONU-ID，却在
+   `airoha_xpon_accept_alloc_id()` 中把 `alloc_id == onu_id` 当作 `-EINVAL`
+   直接返回，因此不会发送任何 ACK。
+4. Airoha vendor `ploam_recv_assign_alloc_id()` 对相同情况不创建新 T-CONT，
+   但仍发送 `XGPON_PLOAM_ACK_OK`。
+5. 这能完整解释严格的 HWTC 重发三次后撤销，而较宽容或流程不同的 ZTEG
+   可以注册。r76 已按 vendor 行为修复：默认 Alloc-ID 使用 shadow T-CONT 0
+   并 ACK OK；其他 Alloc-ID 路径不变。
+
+该判断仍需设备实测确认 `0x0a` 同时是当轮 ONU-ID，并确认修复后 OLT 不再
+重复该消息而继续 Request Registration/OMCI。若仍失败，再回到 Registration
+MIC/PIK 和消息内容排查。
 
 Issue #3 所引用的 Airoha vendor 路径为：
 
@@ -105,6 +113,7 @@ rayniel-an7583-ranging-diagnostics
 当前状态：
 
 - 诊断改动提交并推送到上述审阅分支。
+- r76 默认 Alloc-ID ACK 修复已在本地完成，等待验证和推送。
 - 未创建 Pull Request。
 - 没有生成未经验证的 `.ko`。
 
@@ -172,6 +181,7 @@ PLOAMu_TX=... registration_irq=...
 ## 已完成验证
 
 - `git diff --check` 通过。
+- 源码回归测试包含默认 Alloc-ID 必须进入 ACK 路径的契约。
 - 本次改动没有新增 `udelay`、`usleep` 或无界轮询。
 - 没有加入 `RSP_TIME` 或 `EqD << 2` 行为。
 - ACK 调用点已经检查。

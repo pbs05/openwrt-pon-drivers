@@ -15,7 +15,7 @@ Work in progress. APIs may change substantially.
 
 ## XG-PON BWmap 兼容模式：使用方法
 
-适用于已安装本分支 **xPON r74 或更新版本**的 XG-PON 线路；当前版本为 r75。
+适用于已安装本分支 **xPON r74 或更新版本**的 XG-PON 线路；当前版本为 r76。
 AN7583/HWTC 上实测原厂过滤值 `0x00820000` 可让 ACK、LOID 认证和业务下发继续，
 但后续仍可能收到 OLT Deactivate，**不是保证注册成功的开关，也不是 AES 超时修复**。
 不根据 OLT 厂商自动启用，不影响 EPON；其他硬件/OLT 的效果需单独验证。
@@ -99,7 +99,7 @@ grep 'bwmap_check_control:' /sys/kernel/debug/airoha-xpon-pon0/mac
 
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
-### Improvements informed by other drivers (xPON r75 / frontend r15)
+### Improvements informed by other drivers (xPON r76 / frontend r15)
 
 External fixes are compared and adapted, not merged as whole driver trees:
 
@@ -244,6 +244,19 @@ documents an Airoha vendor path that polls `AIROHA_XGPON_TX_SYNC_READY` for up
 to 3000 us before a Ranging ACK. This branch already implements that bounded
 wait. XGS-PON-specific `RSP_TIME=0x1543` and `EqD << 2` behavior from that
 report is not applied to this 2.5G-upstream XG-PON path.
+
+Starting with r76, an O5 `Assign_Alloc-ID` whose Alloc-ID equals the ONU-ID is
+acknowledged successfully without creating another T-CONT entry. Hardware
+T-CONT 0 already shadows the ONU-ID. This matches the Airoha vendor handler;
+the previous code rejected the message without any ACK, causing strict OLTs to
+repeat the assignment and eventually deactivate the ONU. Non-default Alloc-IDs
+continue through the existing T-CONT table path, so this is compatible with
+OLTs that assign separate Alloc-IDs.
+
+r76 起，O5 中 Alloc-ID 等于 ONU-ID 的 `Assign_Alloc-ID` 会直接成功确认，
+不会重复创建 T-CONT。硬件 T-CONT 0 本来就映射 ONU-ID，这与 Airoha vendor
+处理一致。旧实现对此直接返回错误且不发 ACK，严格的 OLT 会重发后撤销 ONU；
+不同于 ONU-ID 的 Alloc-ID 仍使用原有 T-CONT 表流程。
 
 挂载 debugfs 后，可在一次测距尝试后检查对应接口目录下的 `registration`
 和 `mac`。诊断快照记录最近一次初始 Ranging-Time 的 flags、EqD、EqD 写入前后

@@ -1120,11 +1120,16 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	u8 index;
 	int ret, ack_result;
 
-	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id ||
-	    alloc_id == xpon->onu_id)
+	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id)
 		return -EINVAL;
 
-	if (type == 1)
+	/*
+	 * T-CONT 0 shadows ONU-ID. The vendor path acknowledges this default
+	 * Alloc-ID without trying to create a second table entry.
+	 */
+	if (alloc_id == xpon->onu_id)
+		ret = 0;
+	else if (type == 1)
 		ret = airoha_xpon_find_or_create_tcont(xpon, alloc_id, &index);
 	else if (type == 0xff)
 		ret = airoha_xpon_remove_tcont(xpon, alloc_id);
