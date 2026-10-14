@@ -214,7 +214,10 @@ write, the bounded TX-ready wait result, PLOAMu FIFO state around the Ranging
 ACK, and the ACK submission result. The driver waits up to 3000 us for TX
 synchronization before entering O5 and submitting the initial Ranging ACK. If
 the wait expires, it leaves the ONU in O4, does not submit the ACK, and records
-the timeout. ACKs select the current PLOAM integrity-key group, and directed
+the timeout. After entering O5, the driver submits the Ranging ACK before OMCI
+or data-path notifications, matching the Airoha vendor activation order and
+avoiding delayed FIFO submission beyond the first O5 PLOAMu grant. ACKs select the current PLOAM
+integrity-key group, and directed
 Profile and Ranging-Time messages in O5 are acknowledged, including retries.
 ACK submission failures are reported instead of being counted as accepted
 messages. The snapshot also exposes TX-late and resynchronization counters,
@@ -247,7 +250,9 @@ report is not applied to this 2.5G-upstream XG-PON path.
 的 TX 同步状态、有界等待结果、Ranging ACK 前后的 PLOAMu FIFO 状态及 ACK
 提交结果，并显示 TX late 与重新同步计数。驱动在进入 O5 和提交首次 Ranging
 ACK 前最多等待 TX 同步 3000 微秒；超时则保持 O4、不提交 ACK，并记录超时。
-ACK 使用当前 PLOAM 完整性密钥组；O5 中收到单播 Profile 或 Ranging-Time
+进入 O5 后，驱动先提交 Ranging ACK，再更新 OMCI 和数据路径通知，与 Airoha
+vendor 激活顺序一致，避免 FIFO 提交晚于首个 O5 PLOAMu grant。ACK 使用当前 PLOAM
+完整性密钥组；O5 中收到单播 Profile 或 Ranging-Time
 （包括重发）也会回 ACK。ACK 提交失败会记录错误，不再计入成功处理消息。
 快照还显示硬件 Registration 发送事件计数、首次 ACK 前的密钥索引，以及
 ACK 提交前后和随后 O5 收到 Deactivate 时的总 PLOAMu/ACK 计数，以及

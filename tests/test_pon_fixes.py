@@ -263,6 +263,14 @@ class PonFixTests(unittest.TestCase):
         self.assertIn("AIROHA_XGPON_DBG_BWM_CHK_STS", ranging)
         self.assertIn("AIROHA_XGPON_TX_ERR_STS", ranging)
         self.assertIn("AIROHA_XGPON_US_PROF_VLD", ranging)
+        self.assertLess(
+            ranging.index("airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5)"),
+            ranging.index("ack_result = airoha_xpon_send_ack("),
+        )
+        self.assertLess(
+            ranging.index("ack_result = airoha_xpon_send_ack("),
+            ranging.index("airoha_xpon_update_omci_link(xpon)"),
+        )
         handler = function("airoha_xpon_handle_ploamd")
         self.assertIn(".ploamu_tx_at_deactivate", handler)
         self.assertIn(".bwm_check_at_deactivate", handler)

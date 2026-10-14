@@ -1027,12 +1027,6 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			return ret;
 		}
 
-		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
-		/* O5 marks line activation; service_ready tracks usable service GEMs. */
-		xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
-		airoha_xpon_update_omci_link(xpon);
-		if (xpon->data_path.configured && xpon->pon_netdev)
-			airoha_xpon_set_data_path_link(xpon, true);
 		diagnostic.fifo_before_ack =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
 		diagnostic.ack_key_index =
@@ -1049,6 +1043,12 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
 		diagnostic.ack_tx_before =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+		/*
+		 * Match the vendor activation order: enter O5 and submit the
+		 * Ranging ACK before OMCI and data-path notifications can delay
+		 * FIFO submission beyond the first O5 PLOAMu grant.
+		 */
+		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
 		ack_result = airoha_xpon_send_ack(
 			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
 		diagnostic.ack_attempted = true;
@@ -1064,6 +1064,11 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		diagnostic.tx_error_after_ack =
 			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
 		airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
+		/* O5 marks line activation; service_ready tracks usable service GEMs. */
+		xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
+		airoha_xpon_update_omci_link(xpon);
+		if (xpon->data_path.configured && xpon->pon_netdev)
+			airoha_xpon_set_data_path_link(xpon, true);
 		dev_info(
 			xpon->dev,
 			"PLOAM ranging diagnostic: flags=0x%02x absolute=%u "

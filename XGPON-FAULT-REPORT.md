@@ -159,13 +159,19 @@ PLOAMu_TX=... registration_irq=...
 - TX resync。
 - EqD 算法或数值修改。
 - O 状态切换修改。
-- ACK 时序或提交位置修改。
 - XGS-PON 四倍时基。
+
+后续 vendor 顺序对照补丁有意调整了一处行为：
+
+- 首次 O4 Ranging-Time 写入 EqD、等待 `TX_SYNC_READY` 并进入 O5 后，立即
+  提交 Ranging ACK；OMCI link 和数据路径通知移到 ACK 提交之后。该顺序与
+  vendor 的“进入 O5 → 高优先级 Ranging ACK tasklet → OMCI/event”一致，
+  用于避免 ACK FIFO 提交晚于 HWTC 的首个 O5 PLOAMu grant。
 
 ## 已完成验证
 
 - `git diff --check` 通过。
-- 本次 Registration C/H 改动没有加入 `poll`、`udelay` 或 `usleep`。
+- 本次改动没有新增 `udelay`、`usleep` 或无界轮询。
 - 没有加入 `RSP_TIME` 或 `EqD << 2` 行为。
 - ACK 调用点已经检查。
 - ACK 返回值与 FIFO 状态捕获字段已经检查。
