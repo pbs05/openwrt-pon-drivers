@@ -303,6 +303,10 @@ struct airoha_xpon {
 	bool service_ready;
 	bool stopping;
 	bool active_mode_valid;
+	bool bwmap_override_configured;
+	bool bwmap_stock_override;
+	bool bwmap_stock_applied;
+	u32 bwmap_inherited_control;
 };
 
 /*

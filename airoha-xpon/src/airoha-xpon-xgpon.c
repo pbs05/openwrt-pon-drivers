@@ -14,7 +14,7 @@
 static bool xgpon_stock_bwmap;
 module_param(xgpon_stock_bwmap, bool, 0400);
 MODULE_PARM_DESC(xgpon_stock_bwmap,
-                 "Opt in to stock XG-PON BWmap filters (default: preserve existing settings)");
+                 "Default stock XG-PON BWmap policy; per-device sysfs may override it (default: preserve)");
 
 static void airoha_xpon_xgpon_release_mac_interfaces(struct airoha_xpon *xpon)
 {
@@ -410,6 +410,11 @@ airoha_xpon_xgpon_reset_and_enable_digital_rx(struct airoha_xpon *xpon)
 
 static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 {
+	bool stock_bwmap = xpon->bwmap_override_configured ?
+		                   xpon->bwmap_stock_override :
+		                   xgpon_stock_bwmap;
+
+	lockdep_assert_held(&xpon->state_lock);
 	if (READ_ONCE(xpon->stopping))
 		return -ESHUTDOWN;
 
@@ -421,10 +426,19 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	airoha_xpon_xgpon_counters_start(xpon);
 	airoha_xpon_xgpon_release_mac_interfaces(xpon);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_US_PROF_VLD, 0);
-	/* Preserve inherited filters unless the compatibility setting is enabled. */
-	if (xgpon_stock_bwmap)
+	/* Save the inherited policy so disabling the override is reversible. */
+	if (stock_bwmap) {
+		if (!xpon->bwmap_stock_applied)
+			xpon->bwmap_inherited_control = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL);
 		airoha_xgpon_write(xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL,
 		                   AIROHA_XGPON_BWM_CHK_CTRL_STOCK);
+		xpon->bwmap_stock_applied = true;
+	} else if (xpon->bwmap_stock_applied) {
+		airoha_xgpon_write(xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL,
+		                   xpon->bwmap_inherited_control);
+		xpon->bwmap_stock_applied = false;
+	}
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_RSP_TIME,
 	                         AIROHA_XGPON_RESPONSE_TIME_MASK, 0x551);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_O23_O4_PLOAMU_CTRL,

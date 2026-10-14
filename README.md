@@ -34,46 +34,73 @@ Work in progress. APIs may change substantially.
 ## XG-PON ranging diagnostics / XG-PON 测距诊断
 
 By default, XG-PON MAC activation preserves the existing `DBG_BWM_CHK_CTRL`
-settings. The load-time module parameter `xgpon_stock_bwmap=1` explicitly
-opts in to writing the stock AN7583 `0x00820000` baseline before publishing
-burst profiles on each MAC initialization. MAC reset does not clear inherited
-optional BWmap filters. This setting is not selected automatically by OLT vendor.
+settings. Enabling stock BWmap compatibility writes the stock AN7583
+`0x00820000` baseline before publishing burst profiles on each MAC initialization.
+MAC reset does not clear inherited optional BWmap filters. The setting is
+opt-in, not selected automatically by OLT vendor, and has no effect on EPON.
 
 In an AN7583/HWTC test, replacing the inherited `0x00821f1f` setting with the
 stock baseline enabled ACK transmission, LOID acceptance and service provisioning;
 restoring the inherited setting reproduced early activation failure. Subsequent
 OLT deactivation still occurred with the stock baseline. Individual filter tests
-did not isolate the responsible bit, and ZTEG interoperability has not been
-verified. The opt-in is a diagnostic compatibility setting, not a complete
+did not isolate the responsible bit. The user reports successful registration
+on a ZTEG OLT with r68, but stock-filter interoperability there has not been
+verified. The opt-in is a compatibility setting, not a complete
 registration fix. The `mac` snapshot exposes `bwmap_check_control` and
 `bwmap_check_status`.
 
-For an unloaded module, enable it with
-`modprobe airoha-xpon xgpon_stock_bwmap=1`. For persistent OpenWrt configuration,
-append `xgpon_stock_bwmap=1` to the existing `airoha-xpon` entry in
-`/etc/modules.d/`, then reboot. Do not add a second module entry or unload the
-driver on a live PON connection. The parameter is read-only after loading;
-inspect `/sys/module/airoha_xpon/parameters/xgpon_stock_bwmap` to check the
-selected setting. Omitting the parameter preserves the pre-r72 behavior of
-not writing this register; it does not restore a register changed earlier.
+Starting with r74, `/sys/class/net/pon0/xpon/xgpon_stock_bwmap` stages a per-line
+policy: `default` follows the load-time module parameter, `1` enables stock
+filters, and `0` preserves inherited filters. Writes do not change the live MAC;
+the policy takes effect on its next initialization (including an OLT-triggered
+MAC restart). For deterministic application, restart the PON line after saving.
+If this driver enabled stock filters earlier, disabling restores the value
+saved immediately before enabling, on the next MAC initialization. This saved
+value is held only for the current driver load; it cannot undo register changes
+made before probe or recover a previous boot's value.
 
-默认情况下，XG-PON MAC 激活保留现有 `DBG_BWM_CHK_CTRL` 设置。只有在模块
-加载时指定 `xgpon_stock_bwmap=1`，才会在每次 MAC 初始化、发布 burst profile
-之前写入 AN7583 原厂基准值 `0x00820000`。MAC 复位不会清除继承的可选 BWmap
-过滤设置，也不会根据 OLT 厂商自动启用此选项。
+With `airoha-ponctl` 0.2.0-r2 and `luci-app-pon` 0.1.0-r4 from
+[the userspace compatibility branch](https://github.com/rayniel/openwrt-pon-userspace/tree/rayniel/hwtc-pm-compatibility),
+select **PON → Configuration → PON line → XG-PON BWmap compatibility →
+Stock filters (HWTC compatibility)**, save and apply, then restart the PON line
+or reboot. The equivalent persistent UCI setting is:
 
-在 AN7583/HWTC 的一次测试中，将继承值 `0x00821f1f` 改为原厂基准值后，
-ACK 发送、LOID 接受和业务下发成功；恢复继承值则早期激活故障复现。但使用
-原厂基准值后仍发生后续 OLT 撤销，逐位测试也未确定具体原因，ZTEG 兼容性
-尚未验证。因此该选项是诊断兼容设置，不是完整注册修复。
-`mac` 快照显示 `bwmap_check_control` 和 `bwmap_check_status`。
+```sh
+uci set pon.line0.xgpon_stock_bwmap='1'
+uci commit pon
+/etc/init.d/pon reload
+# Reboot, or use LuCI's PON diagnostics "Restart PON line".
+```
 
-模块尚未加载时可使用 `modprobe airoha-xpon xgpon_stock_bwmap=1`。
-在 OpenWrt 上持久启用时，将 `xgpon_stock_bwmap=1` 追加到 `/etc/modules.d/`
-中已有的 `airoha-xpon` 条目后重启，不要新增重复条目，也不要在活动 PON
-连接上卸载驱动。参数加载后只读，可检查
-`/sys/module/airoha_xpon/parameters/xgpon_stock_bwmap`。
-不指定参数时保留 r72 之前不写此寄存器的行为，但不会还原此前已被修改的值。
+Replace `line0` and `pon0` if your configured section/device names differ.
+Setting the UCI option to `0` explicitly disables the override; `default`
+returns to the module policy. The sysfs value reports the staged policy, not
+hardware readback. Check `bwmap_check_control` in the `mac` snapshot to verify
+`0x00820000` after activation.
+
+The older load-time interface remains available:
+`modprobe airoha-xpon xgpon_stock_bwmap=1` for an unloaded module, or append
+that parameter to the existing `airoha-xpon` entry in `/etc/modules.d/` and
+reboot. Do not add a duplicate entry or unload the driver on a live PON
+connection. `/sys/module/airoha_xpon/parameters/xgpon_stock_bwmap` is read-only
+and reports only this default, not a per-line override.
+
+默认仍保留继承的过滤设置，不根据 OLT 厂商自动开启。原厂值 `0x00820000`
+已在 AN7583/HWTC 的单变量测试中使 ACK、LOID 认证和业务下发得以继续，但
+后续 OLT 撤销仍需结合 userspace PM 修复验证，不能保证最终注册成功。用户
+已确认 r68 可在 ZTEG OLT 注册；该场景不默认启用原厂过滤设置。本选项不影响 EPON。
+
+r74 新增每线路 sysfs 选项，配合上述 userspace 版本，可在 LuCI 的
+**PON → 配置 → PON 线路 → XG-PON BWmap 兼容模式**中选择
+**原厂过滤设置（HWTC 兼容）**。保存并应用后，在 PON 诊断页重启线路，
+或重启设备。也可使用上述 UCI 命令持久开启，设为 `0` 关闭，设为 `default`
+跟随模块加载参数。若本次驱动加载期间开启过，关闭后会在下次 MAC 初始化
+恢复开启前保存的值；不能恢复驱动加载之前或上一次启动留下的修改。
+
+sysfs 写入只暂存策略，不在活动连接上直接改变寄存器；下次 MAC 初始化
+（包括 OLT 触发的 MAC 重启）生效。读取该属性只能确认暂存策略，应通过
+`mac` 快照中的 `bwmap_check_control` 确认硬件值。原 r73 的模块加载参数仍可
+使用，但无需再手工修改 `/etc/modules.d/` 即可通过 UCI/LuCI 控制。
 
 With debugfs mounted, inspect
 `/sys/kernel/debug/airoha-xpon-<interface>/registration` and `mac` after a
