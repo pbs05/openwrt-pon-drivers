@@ -78,7 +78,7 @@ static unsigned int fmcs_ploam_collect(struct fmcs_priv *priv, bool irq)
 	if (atomic_read(&priv->fpga_status) != FMCS_FPGA_STATUS_READY)
 		goto out;
 	if (irq) {
-		/* Stock FmcsRecvPacketKthread reads raw 0xb0; bit 0 is PLOAM. */
+		/* Read raw register 0xb0; bit 0 indicates PLOAM. */
 		if (fmcs_spi_read_fpga_reg(priv, 0xb0, &events)) {
 			priv->rx_errors++;
 			goto out;
@@ -305,8 +305,8 @@ static irqreturn_t fmcs_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/* Older HM2004 DTBs expose only clock/data/IRQ. Stock fpga_load additionally
- * uses GPIO 5 (configuration reset), 22 (enable), 27 (INIT), 28 (DONE).
+/* Older HM2004 DTBs expose only clock/data/IRQ. FPGA programming also
+ * requires GPIO 5 (configuration reset), 22 (enable), 27 (INIT), 28 (DONE).
  * Keep this compatibility mapping restricted to the verified board.
  */
 static struct gpiod_lookup_table hm2004_fpga_gpios = {
@@ -362,7 +362,7 @@ static int fmcs_load_fpga_bitstream(struct fmcs_priv *priv, const char *fw_name)
 
 	gpiod_direction_output(priv->gpiod_clk, 0);
 	gpiod_direction_output(priv->gpiod_data, 0);
-	/* Stock ExeLoadOnce: reset low >=1us, release, wait 5ms for INIT. */
+	/* Hold reset low for >=1us, release, then wait 5ms for INIT. */
 	gpiod_set_value_cansleep(priv->gpiod_enable, 0);
 	gpiod_set_value_cansleep(priv->gpiod_config, 0);
 	udelay(10);
@@ -509,7 +509,7 @@ static int fmcs_probe(struct platform_device *pdev)
 
 	dev_info(dev, "Mapped AN7581 MMIO: SPI=%px, NFI=%px\n", priv->spi_base, priv->nfi_base);
 
-	/* Enable SPI CS1 pad/pinmux on AN7581 (Discovered from stock vmlinux probe at 0x576ae8) */
+	/* Enable SPI CS1 pad/pinmux on AN7581. */
 	{
 		void __iomem *pad_base = ioremap(0x1FA20218, 4);
 		if (pad_base) {

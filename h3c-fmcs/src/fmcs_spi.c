@@ -13,7 +13,7 @@
 #include <linux/ratelimit.h>
 #include "fmcs.h"
 
-/* Stock uses one dummy clock; expose this for wire-alignment diagnostics. */
+/* Use one dummy clock by default; expose this for wire-alignment diagnostics. */
 static unsigned int spi_dummy = 1;
 module_param(spi_dummy, uint, 0600);
 MODULE_PARM_DESC(spi_dummy, "CS1 manual-mode dummy clocks (0..15)");
@@ -23,7 +23,7 @@ static unsigned int spi_rx_skip;
 module_param(spi_rx_skip, uint, 0600);
 MODULE_PARM_DESC(spi_rx_skip, "Leading CS1 response bits to clock past (0..7); captures an extra byte");
 
-/* Stock ISSUE_TN writes the low three sampling bits; retain its enable bit. */
+/* Write the low three sampling bits while retaining the enable bit. */
 static unsigned int spi_tn = 10;
 module_param(spi_tn, uint, 0600);
 MODULE_PARM_DESC(spi_tn, "CS1 sampling TN (10 verified with CRC); restored for NAND");
@@ -282,7 +282,7 @@ int fmcs_spi_read_fpga_reg(struct fmcs_priv *priv, u32 addr, u32 *val)
 	if (ret)
 		goto out_unlock;
 
-	/* FPGA internal processing delay (stock: 50us) */
+	/* FPGA internal processing delay: 50us. */
 	udelay(50);
 
 	/* Phase 2: Read 4 bytes of register data with command 0x50 */
@@ -328,7 +328,7 @@ int fmcs_spi_read_bosa_reg(struct fmcs_priv *priv, u32 addr, u32 *val)
 	if (ret)
 		goto out_unlock;
 
-	/* BOSA controller internal processing delay (stock: 600us) */
+	/* BOSA controller internal processing delay: 600us. */
 	udelay(600);
 
 	ret = fmcs_raw_spi_read_locked(priv, &rx_cmd, 1, rx_resp, sizeof(rx_resp));
@@ -352,7 +352,7 @@ int fmcs_spi_send_ploam(struct fmcs_priv *priv, const u8 *data, size_t len)
 		return -EINVAL;
 
 	/*
-	 * Stock FmcsSpiSendPloamMsg wire layout:
+	 * PLOAM SPI transmit wire layout:
 	 * buf[0]    = 0xAA (SPI Send PLOAM command)
 	 * buf[1..4] = 0x00, 0x00, 0x00, 0x00 (4 bytes dummy/padding header)
 	 * buf[5..17]= 13 bytes PLOAM frame (ONU-ID, Msg-ID, 10 bytes payload, CRC)
@@ -373,7 +373,7 @@ int fmcs_spi_send_ploam(struct fmcs_priv *priv, const u8 *data, size_t len)
 int fmcs_spi_recv_ploam(struct fmcs_priv *priv, u8 *data, size_t *len)
 {
 	/*
-	 * Stock FmcsSpiRecvPloamMsg layout:
+	 * PLOAM SPI receive request layout:
 	 * Byte 0:    0xA2 (SPI read request command)
 	 * Byte 1..4: 0x00, 0x00, 0x00, 0x10 (little-endian 0x10000000)
 	 */
