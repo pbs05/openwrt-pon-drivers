@@ -153,21 +153,30 @@ static bool en7572_bob_table_valid(const u8 *table)
 	return has_nonzero && has_non_ff;
 }
 
-static void en7572_apply_tx_ddmi_fallback(struct device *dev, struct en7572 *en)
+/*
+ * Devices provisioned for XG/XGS ship calibration only in the A2 profile,
+ * which leaves XE/XES running from an erased A0 table. The A2 wavelength plan
+ * overlays the XE/XES bands, so borrowing the A2 codes is the only usable
+ * fallback for a whole-erased A0 calibration.
+ */
+static void en7572_apply_a0_calibration_fallback(struct device *dev,
+                                                 struct en7572 *en)
 {
 	u8 *a0 = en->bob + EN7572_BOB_A0_BASE;
 	const u8 *a2 = en->bob + EN7572_BOB_A2_BASE;
-	u32 a0_tssi = get_unaligned_le32(a0 + EN7572_BOB_TSSI_CAL_1);
-	u32 a2_tssi = get_unaligned_le32(a2 + EN7572_BOB_TSSI_CAL_1);
+	bool a2_valid = en7572_bob_table_valid(a2);
+	size_t length = EN7572_BOB_CAL_LAST - EN7572_BOB_CAL_FIRST + 1;
 
-	/* Keep both wavelength profiles on the same TX DDMI code when A0 is empty. */
-	if (a0_tssi != U32_MAX)
+	/* A populated A0 table carries per-device data and is never touched. */
+	if (en7572_bob_table_valid(a0))
 		return;
 
-	memcpy(a0 + EN7572_BOB_TSSI_CAL_1, a2 + EN7572_BOB_TSSI_CAL_1,
-	       sizeof(a0_tssi));
-	dev_warn(dev, "BOB A0 TX DDMI is erased; copied 4 bytes from A2%s\n",
-	         a2_tssi == U32_MAX ? " (A2 source is also erased)" : "");
+	memcpy(a0 + EN7572_BOB_CAL_FIRST, a2 + EN7572_BOB_CAL_FIRST, length);
+	if (a2_valid)
+		dev_warn(dev,
+		         "BOB A0 calibration is erased; borrowed the A2 calibration codes for XE/XES\n");
+	else
+		dev_warn(dev, "BOB A0 calibration is erased; A2 is erased as well\n");
 }
 
 /* EN7572 reads use a big-endian 16-bit subaddress and repeated start. */
@@ -405,6 +414,9 @@ static int en7572_load_bob(struct device *dev, struct en7572 *en)
 	loaded = true;
 
 validate:
+	en7572_apply_a0_calibration_fallback(dev, en);
+
+	/* Judge validity after the fallback so a borrowed A0 profile counts. */
 	en->bob_a0_valid = en7572_bob_table_valid(en->bob);
 	en->bob_a2_valid = en7572_bob_table_valid(en->bob + EN7572_BOB_A2_BASE);
 
@@ -416,8 +428,6 @@ validate:
 		dev_warn(
 			dev,
 			"BOB A2 calibration area is empty; XG/XGS will use erased/default register codes\n");
-
-	en7572_apply_tx_ddmi_fallback(dev, en);
 
 	dev_info(dev, "BOB %s: A0=%s A2=%s\n",
 	         loaded ? "loaded from NVMEM" : "using erased fallback",
