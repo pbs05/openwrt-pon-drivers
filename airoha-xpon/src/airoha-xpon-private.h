@@ -87,6 +87,15 @@ struct airoha_xpon_epon {
 	unsigned int sync_loss_count;
 	unsigned int recovery_count;
 	unsigned int full_reinit_count;
+	/*
+	 * Set by the MPCP timeout path when a registered MAC stops reaching the
+	 * OLT. link_work consumes it and reloads the optical frontend.
+	 */
+	bool frontend_reset_pending;
+	bool frontend_reset_forced;
+	unsigned int registered_timeout_streak;
+	unsigned int frontend_reset_count;
+	unsigned long frontend_reset_after;
 	unsigned long registered_since;
 	unsigned long last_registration_lifetime;
 	unsigned int mac_error_count;

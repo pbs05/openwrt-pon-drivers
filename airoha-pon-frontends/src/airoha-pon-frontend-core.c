@@ -196,6 +196,15 @@ int airoha_pon_frontend_set_tx_enable(struct airoha_pon_frontend *frontend,
 }
 EXPORT_SYMBOL_GPL(airoha_pon_frontend_set_tx_enable);
 
+int airoha_pon_frontend_reset(struct airoha_pon_frontend *frontend)
+{
+	if (!frontend->ops->reset)
+		return -EOPNOTSUPP;
+
+	return frontend->ops->reset(frontend);
+}
+EXPORT_SYMBOL_GPL(airoha_pon_frontend_reset);
+
 MODULE_AUTHOR("pbs05 <27010143+pbs05@users.noreply.github.com>");
 MODULE_DESCRIPTION("Airoha PON frontend provider core");
 MODULE_LICENSE("GPL");

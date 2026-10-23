@@ -12,7 +12,9 @@
 #include <linux/of.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/jiffies.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #define EN7572_RUNTIME_ADDR 0x51
 
@@ -123,6 +125,9 @@ struct en7572 {
 	bool prepared;
 	enum airoha_pon_frontend_mode prepared_mode;
 	bool tx_gate_enabled;
+	/* Post-enable captures that show how the TX path evolves after a burst. */
+	struct delayed_work sample_work;
+	unsigned int sample_shot;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -582,6 +587,123 @@ static int en7572_initialize_md32(struct en7572 *en)
 	                          EN7572_BEN_MODE_OFF);
 }
 
+/*
+ * A wedged module stays reachable over I2C while its TX path goes dark, so the
+ * cause only shows up in these runtime registers. Captures are tagged and the
+ * boot sequence takes a reference the wedged state can be read against.
+ */
+static void en7572_log_state(struct en7572 *en, const char *tag)
+{
+	u8 fw = 0, mcu_idle = 0, los = 0;
+	u16 alarm = 0, warning = 0, rssi = 0;
+	u16 temp = 0, vcc = 0, bias = 0, tx_power = 0, rx_power = 0;
+	u32 txdis = 0, sys = 0;
+	int ret;
+
+	mutex_lock(&en->lock);
+	ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG, &fw, sizeof(fw));
+	if (!ret)
+		ret = en7572_read(en->runtime, EN7572_MCU_IDLE_REG, &mcu_idle,
+		                  sizeof(mcu_idle));
+	if (!ret)
+		ret = en7572_read(en->runtime, EN7572_LOS_STATUS_REG, &los,
+		                  sizeof(los));
+	if (!ret)
+		ret = en7572_read_u32(en->runtime, EN7572_TX_DISABLE_STATUS_REG,
+		                      &txdis);
+	if (!ret)
+		ret = en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys);
+	if (!ret)
+		ret = en7572_read_u16(en->runtime, EN7572_ALARM_REG, &alarm);
+	if (!ret)
+		ret = en7572_read_u16(en->runtime, EN7572_WARNING_REG, &warning);
+	if (!ret)
+		ret = en7572_read_u16(en->runtime, EN7572_RSSI_ADC_REG, &rssi);
+	if (!ret)
+		ret = en7572_read_be16(en->runtime, EN7572_TEMPERATURE_REG, &temp);
+	if (!ret)
+		ret = en7572_read_be16(en->runtime, EN7572_VOLTAGE_REG, &vcc);
+	if (!ret)
+		ret = en7572_read_be16(en->runtime, EN7572_TX_BIAS_REG, &bias);
+	if (!ret)
+		ret = en7572_read_be16(en->runtime, EN7572_TX_POWER_REG, &tx_power);
+	if (!ret)
+		ret = en7572_read_be16(en->runtime, EN7572_RX_POWER_REG, &rx_power);
+	mutex_unlock(&en->lock);
+
+	if (ret) {
+		dev_warn(&en->program->dev, "state[%s]: capture failed: %d\n",
+		         tag, ret);
+		return;
+	}
+
+	dev_info(&en->program->dev,
+	         "state[%s] fw=0x%02x mcu_idle=0x%02x los=0x%02x txdis=0x%08x sys=0x%08x alarm=0x%04x warn=0x%04x rssi=0x%04x temp=0x%04x vcc=0x%04x bias=0x%04x txp=0x%04x rxp=0x%04x prepared=%u gate=%u\n",
+	         tag, fw, mcu_idle, los, txdis, sys, alarm, warning, rssi, temp,
+	         vcc, bias, tx_power, rx_power, en->prepared,
+	         en->tx_gate_enabled);
+}
+
+/* Sample offsets after the burst gate opens; the wedge shows up within a second. */
+static const unsigned int en7572_sample_ms[] = { 250, 1000, 2000 };
+static const char *const en7572_sample_tag[] = { "tx+0.25s", "tx+1.25s",
+                                                 "tx+3.25s" };
+
+static void en7572_sample_work(struct work_struct *work)
+{
+	struct en7572 *en = container_of(to_delayed_work(work), struct en7572,
+	                                 sample_work);
+	unsigned int shot = en->sample_shot;
+
+	if (shot >= ARRAY_SIZE(en7572_sample_ms))
+		return;
+
+	en7572_log_state(en, en7572_sample_tag[shot]);
+	en->sample_shot = shot + 1;
+	if (en->sample_shot < ARRAY_SIZE(en7572_sample_ms))
+		schedule_delayed_work(
+			&en->sample_work,
+			msecs_to_jiffies(en7572_sample_ms[en->sample_shot]));
+}
+
+/* A stopped MD32 keeps the I2C window alive but stops refreshing its version. */
+static bool en7572_md32_started(struct en7572 *en)
+{
+	u8 fw;
+	int ret;
+
+	ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG, &fw, sizeof(fw));
+	if (ret)
+		return false;
+
+	return fw != 0x00 && fw != 0xff;
+}
+
+static int en7572_start_md32(struct en7572 *en, const char *why)
+{
+	int attempt, ret;
+
+	for (attempt = 1; attempt <= 3; attempt++) {
+		ret = en7572_initialize_md32(en);
+		if (ret)
+			return ret;
+		if (en7572_md32_started(en))
+			return 0;
+		dev_warn(&en->program->dev,
+		         "MD32 reported no firmware version on %s (attempt %d of 3)\n",
+		         why, attempt);
+	}
+
+	/*
+	 * Some modules only publish their version once the line is up, so a
+	 * missing value here is not fatal: prepare() and the recovery path
+	 * still get their chance to bring the burst engine back.
+	 */
+	dev_info(&en->program->dev,
+	         "MD32 version still unreadable on %s, continuing\n", why);
+	return 0;
+}
+
 static int en7572_bob_base(enum airoha_pon_frontend_mode mode)
 {
 	switch (mode) {
@@ -735,6 +857,10 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 
 out_unlock:
 	mutex_unlock(&en->lock);
+
+	if (!ret)
+		en7572_log_state(en, "prepared");
+
 	return ret;
 }
 
@@ -847,6 +973,11 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 			if (en->tx_disable)
 				gpiod_set_value_cansleep(en->tx_disable, 0);
 			en->tx_gate_enabled = true;
+			/* Sample the burst path while it is supposed to be alive. */
+			en->sample_shot = 0;
+			mod_delayed_work(
+				system_wq, &en->sample_work,
+				msecs_to_jiffies(en7572_sample_ms[0]));
 		}
 	} else {
 		/* Assert board TX_DISABLE before closing the internal BEN gate. */
@@ -880,9 +1011,47 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
 	return ret;
 }
 
+static int en7572_reset(struct airoha_pon_frontend *frontend)
+{
+	struct en7572 *en = airoha_pon_frontend_priv(frontend);
+	u8 fw_version = 0;
+	int ret;
+
+	/*
+	 * A wedged module still answers every I2C access, but its APC loop has
+	 * stopped: bias current keeps flowing while no light leaves the fibre.
+	 * prepare() only rewrites calibration codes, so rebinding the consumer
+	 * driver cannot clear this; the MD32 firmware has to be reloaded and
+	 * restarted from the PM/DM/BOB images captured at probe time.
+	 */
+	en7572_log_state(en, "wedged");
+
+	mutex_lock(&en->lock);
+	en->prepared = false;
+	en->tx_gate_enabled = false;
+	if (en->tx_disable)
+		gpiod_set_value_cansleep(en->tx_disable, 1);
+	ret = en7572_start_md32(en, "recovery");
+	if (!ret)
+		ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG,
+		                  &fw_version, sizeof(fw_version));
+	mutex_unlock(&en->lock);
+
+	if (ret)
+		return ret;
+
+	en7572_log_state(en, "reloaded");
+
+	dev_info(&en->program->dev,
+	         "MD32 firmware reloaded from stored images, fw=0x%02x\n",
+	         fw_version);
+	return 0;
+}
+
 static const struct airoha_pon_frontend_ops en7572_frontend_ops = {
 	.prepare = en7572_prepare,
 	.unprepare = en7572_unprepare,
+	.reset = en7572_reset,
 	.get_signal_status = en7572_get_signal_status,
 	.get_diagnostics = en7572_get_diagnostics,
 	.get_link_config = en7572_get_link_config,
@@ -916,6 +1085,7 @@ static int en7572_probe(struct i2c_client *client)
 
 	en->program = client;
 	mutex_init(&en->lock);
+	INIT_DELAYED_WORK(&en->sample_work, en7572_sample_work);
 	/* GPIO descriptors translate logical assertion to board-level polarity. */
 	en->tx_disable =
 		devm_gpiod_get_optional(dev, "tx-disable", GPIOD_OUT_HIGH);
@@ -967,7 +1137,7 @@ static int en7572_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	ret = en7572_initialize_md32(en);
+	ret = en7572_start_md32(en, "probe");
 	if (ret)
 		return dev_err_probe(dev, ret,
 		                     "EN7572 MD32 initialization failed\n");
@@ -1002,6 +1172,8 @@ static int en7572_probe(struct i2c_client *client)
 		en->chip_id, en->chip_rev, fw_version, los_status,
 		en->tx_disable ? ", board TX_DISABLE asserted" : "");
 
+	en7572_log_state(en, "probe");
+
 	return 0;
 }
 
@@ -1011,6 +1183,7 @@ static void en7572_remove(struct i2c_client *client)
 	struct en7572 *en = airoha_pon_frontend_priv(frontend);
 
 	airoha_pon_frontend_unregister(frontend);
+	cancel_delayed_work_sync(&en->sample_work);
 	/* Close the external TX path before the internal BEN gate. */
 	mutex_lock(&en->lock);
 	if (en->tx_disable)

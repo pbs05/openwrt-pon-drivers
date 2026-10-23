@@ -115,6 +115,7 @@ struct airoha_pon_frontend_link_config {
  * @get_diagnostics: Read optical telemetry and calibration state
  * @get_link_config: Return SoC electrical settings for a line mode
  * @set_tx_enable: Connect or disconnect the PON burst-enable signal
+ * @reset: Reload the provider firmware and return to the idle state
  *
  * set_tx_enable(true) leaves burst timing under PON MAC control. Provider
  * operations may sleep.
@@ -133,6 +134,12 @@ struct airoha_pon_frontend_ops {
 	                       enum airoha_pon_frontend_mode mode,
 	                       struct airoha_pon_frontend_link_config *config);
 	int (*set_tx_enable)(struct airoha_pon_frontend *frontend, bool enable);
+	/*
+	 * Optional. Providers that run firmware on a local core can wedge while
+	 * every register stays reachable. reset() reloads that firmware; the
+	 * caller re-runs prepare() before the burst gate is opened again.
+	 */
+	int (*reset)(struct airoha_pon_frontend *frontend);
 };
 
 struct airoha_pon_frontend {
@@ -173,5 +180,6 @@ int airoha_pon_frontend_get_link_config(
 	struct airoha_pon_frontend_link_config *config);
 int airoha_pon_frontend_set_tx_enable(struct airoha_pon_frontend *frontend,
                                       bool enable);
+int airoha_pon_frontend_reset(struct airoha_pon_frontend *frontend);
 
 #endif /* __AIROHA_PON_FRONTEND_H */

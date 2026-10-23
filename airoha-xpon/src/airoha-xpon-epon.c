@@ -145,6 +145,15 @@
 #define AIROHA_EPON_DISCOVERY_SYNC_UPDATE BIT(24)
 #define AIROHA_EPON_DISCOVERY_RETRY_COUNT 3
 #define AIROHA_EPON_NACK_SILENT_MS        60000
+/*
+ * A registered ONU that misses this many consecutive MPCP grants is not being
+ * outvoted by the OLT: its burst engine stopped reaching the fibre. The EN7572
+ * keeps a static bias in that state, so TX power collapses while every register
+ * stays readable, and only a provider firmware reload clears it.
+ */
+#define AIROHA_EPON_TX_WEDGE_TIMEOUTS     3
+#define AIROHA_EPON_TX_WEDGE_EPOCH_MS     5000
+#define AIROHA_EPON_TX_WEDGE_RETRY_MS     30000
 /* The standard MAC path starts at 0x20; OLT values are capped at 0x5f. */
 #define AIROHA_EPON_SYNC_TIME_DEFAULT    0x20
 #define AIROHA_EPON_SYNC_TIME_MAX        0x5f
@@ -288,7 +297,9 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           "tx_mpcp: %u\n"
 	           "rx_oam: %u\n"
 	           "mac_errors: %u\n"
-	           "last_mac_error: 0x%08x\n",
+	           "last_mac_error: 0x%08x\n"
+	           "registered_timeout_streak: %u\n"
+	           "frontend_reloads: %u\n",
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_ENABLE),
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS2),
@@ -301,7 +312,9 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           airoha_epon_read(xpon, AIROHA_EPON_RX_MPCP_COUNT),
 	           airoha_epon_read(xpon, AIROHA_EPON_TX_MPCP_COUNT),
 	           airoha_epon_read(xpon, AIROHA_EPON_RX_OAM_COUNT),
-	           xpon->epon.mac_error_count, xpon->epon.last_mac_error);
+	           xpon->epon.mac_error_count, xpon->epon.last_mac_error,
+	           xpon->epon.registered_timeout_streak,
+	           xpon->epon.frontend_reset_count);
 }
 
 static void airoha_xpon_epon_set_discovery_state(struct airoha_xpon *xpon,
@@ -853,6 +866,28 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 		airoha_xpon_epon_complete_registration(xpon);
 	if (events & AIROHA_EPON_INT_MPCP_TIMEOUT) {
 		xpon->epon.mpcp_timeout_count++;
+		/*
+		 * Timeouts outside the registered state belong to normal discovery
+		 * and must not escalate; a registered MAC has a grant every period.
+		 */
+		if (xpon->epon.mpcp_state == AIROHA_EPON_MPCP_REGISTERED) {
+			/*
+			 * Only a tight re-registration loop escalates: a registration
+			 * that survives for a while proves the burst path works.
+			 */
+			if (jiffies_to_msecs(jiffies -
+			                     xpon->epon.registered_since) >
+			    AIROHA_EPON_TX_WEDGE_EPOCH_MS)
+				xpon->epon.registered_timeout_streak = 0;
+			xpon->epon.registered_timeout_streak++;
+			if (xpon->epon.registered_timeout_streak >=
+			    AIROHA_EPON_TX_WEDGE_TIMEOUTS) {
+				xpon->epon.frontend_reset_pending = true;
+				mod_delayed_work(system_wq, &xpon->link_work, 0);
+			}
+		} else {
+			xpon->epon.registered_timeout_streak = 0;
+		}
 		dev_warn_ratelimited(
 			xpon->dev,
 			"EPON MPCP timeout: state=%u llid_valid=%u\n",
@@ -932,6 +967,82 @@ irqreturn_t airoha_xpon_epon_phy_irq(struct airoha_xpon *xpon)
 		queue_delayed_work(system_wq, &xpon->link_work, 0);
 
 	return IRQ_HANDLED;
+}
+
+int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
+{
+	struct airoha_pon_frontend_diagnostics diagnostics = {};
+	const struct airoha_xpon_mode_info *mode;
+	bool forced = xpon->epon.frontend_reset_forced;
+	int ret;
+
+	if (!xpon->epon.frontend_reset_pending && !forced)
+		return 0;
+
+	xpon->epon.frontend_reset_pending = false;
+	xpon->epon.frontend_reset_forced = false;
+
+	if (!xpon->tx_armed || !airoha_xpon_mode_is_epon(xpon->active_mode))
+		return 0;
+
+	/* A real OLT-side fault must not turn the reload into a reset loop. */
+	if (!forced && time_before(jiffies, xpon->epon.frontend_reset_after))
+		return 0;
+
+	mode = airoha_xpon_mode_info(xpon->active_mode);
+	if (!mode)
+		return -EOPNOTSUPP;
+
+	/* Best-effort telemetry for the log; providers without it report none. */
+	airoha_pon_frontend_get_diagnostics(xpon->frontend, &diagnostics);
+
+	dev_warn(xpon->dev,
+	         "EPON burst engine wedged: %u MPCP timeouts while registered (llid=0x%04x state=%u int=0x%08x dsc=0x%08x rx_mpcp=%u rx_oam=%u tx_bias=0x%04x tx_power=0x%04x); reloading optical frontend\n",
+	         xpon->epon.registered_timeout_streak, xpon->epon.llid,
+	         xpon->epon.mpcp_state,
+	         airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
+	         airoha_epon_read(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL),
+	         airoha_epon_read(xpon, AIROHA_EPON_RX_MPCP_COUNT),
+	         airoha_epon_read(xpon, AIROHA_EPON_RX_OAM_COUNT),
+	         diagnostics.tx_bias, diagnostics.tx_power);
+
+	airoha_xpon_epon_stop_rx(xpon);
+
+	/*
+	 * Providers without firmware cannot reload anything, and the PCS restart
+	 * below is the only recovery they have.
+	 */
+	ret = airoha_pon_frontend_reset(xpon->frontend);
+	if (ret == -EOPNOTSUPP) {
+		dev_warn(xpon->dev,
+		         "optical frontend cannot reload firmware; restarting the PCS only\n");
+		ret = 0;
+	} else if (!ret) {
+		xpon->epon.frontend_reset_count++;
+		ret = airoha_pon_frontend_prepare(xpon->frontend,
+		                                  mode->frontend_mode);
+	}
+
+	if (ret) {
+		dev_err(xpon->dev, "optical frontend reload failed: %d\n", ret);
+		xpon->epon.frontend_reset_after =
+			jiffies + msecs_to_jiffies(AIROHA_EPON_TX_WEDGE_RETRY_MS);
+		return ret;
+	}
+
+	xpon->epon.registered_timeout_streak = 0;
+	xpon->epon.frontend_reset_after =
+		jiffies + msecs_to_jiffies(AIROHA_EPON_TX_WEDGE_RETRY_MS);
+
+	ret = airoha_xpon_epon_start_rx(xpon);
+	if (ret)
+		return ret;
+
+	/* PCS sync restarts the MAC epoch; advance() re-arms the burst gate. */
+	dev_info(xpon->dev,
+	         "optical frontend reloaded (%u), restarting EPON line sync\n",
+	         xpon->epon.frontend_reset_count);
+	return 0;
 }
 
 int airoha_xpon_epon_advance(struct airoha_xpon *xpon, u32 phy_events,
