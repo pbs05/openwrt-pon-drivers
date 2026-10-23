@@ -444,6 +444,14 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	}
 	airoha_xpon_leds_update(xpon);
 
+	/*
+	 * An armed EPON MAC that keeps missing grants needs its optics reloaded;
+	 * the reload runs under state_lock and restarts the line itself.
+	 */
+	if (airoha_xpon_mode_is_epon(xpon->active_mode) &&
+	    airoha_xpon_epon_recover_tx(xpon))
+		goto out_requeue;
+
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
 		if (atomic_xchg(&xpon->mac_restart_pending, 0))
