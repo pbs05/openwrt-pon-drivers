@@ -77,6 +77,12 @@ struct airoha_xpon_epon {
 	/* Hard IRQ updates these values; readers use atomic_read(). */
 	atomic_t discovery_gate_count;
 	atomic_t register_request_count;
+	/*
+	 * Discovery Gates skipped because the optical TX path had not reported
+	 * ready yet. A Register Request sent into that window is lost and latches
+	 * the MAC discovery state machine, so the gate is deferred instead.
+	 */
+	unsigned int tx_deferrals;
 	unsigned int register_message_count;
 	unsigned int register_ack_count;
 	unsigned int nack_count;

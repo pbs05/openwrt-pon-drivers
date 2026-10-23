@@ -140,6 +140,16 @@ struct en7572 {
 	struct delayed_work sample_work;
 	unsigned int sample_shot;
 	unsigned int tx_recommit;
+	/*
+	 * Readiness poll. The MAC may answer a Discovery Gate as soon as the
+	 * burst gate opens, but the analog path needs time to report TX ready.
+	 * A Register Request sent into that window is lost and latches the MAC
+	 * discovery state machine, so the readout is published here for the MAC
+	 * hard IRQ, which cannot touch the bus.
+	 */
+	struct delayed_work ready_work;
+	unsigned long gate_opened;
+	bool tx_ready_state;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -676,6 +686,62 @@ static bool en7572_tx_ready(struct en7572 *en)
 	return !!(sys & EN7572_SYS_TX_READY);
 }
 
+#define EN7572_READY_POLL_MS        20
+#define EN7572_READY_POLL_WINDOW_MS 3000
+#define EN7572_READY_POLL_IDLE_MS   1000
+
+static bool en7572_tx_ready_cached(struct airoha_pon_frontend *frontend)
+{
+	struct en7572 *en = airoha_pon_frontend_priv(frontend);
+
+	return READ_ONCE(en->tx_ready_state);
+}
+
+/*
+ * Warm lines report ready within a few hundred milliseconds of the gate
+ * opening, cold ones need more than a second. Poll fast while the answer is
+ * still no so the MAC can answer the first capable Discovery Gate, then fall
+ * back to a slow poll that keeps the cached flag honest.
+ */
+static void en7572_ready_work(struct work_struct *work)
+{
+	struct en7572 *en = container_of(to_delayed_work(work), struct en7572,
+	                                 ready_work);
+	bool ready;
+	unsigned int delay;
+	u32 sys = 0;
+
+	if (!READ_ONCE(en->tx_gate_enabled))
+		return;
+
+	if (en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys)) {
+		/* An unreadable bus proves nothing; keep the last answer. */
+		schedule_delayed_work(&en->ready_work,
+		                      msecs_to_jiffies(EN7572_READY_POLL_MS));
+		return;
+	}
+
+	ready = !!(sys & EN7572_SYS_TX_READY);
+	if (ready != READ_ONCE(en->tx_ready_state)) {
+		WRITE_ONCE(en->tx_ready_state, ready);
+		if (ready)
+			dev_info(&en->program->dev,
+			         "TX path ready %u ms after the gate opened\n",
+			         jiffies_to_msecs(jiffies - en->gate_opened));
+	}
+
+	if (ready)
+		delay = EN7572_READY_POLL_IDLE_MS;
+	else if (time_after(jiffies, en->gate_opened +
+	                                 msecs_to_jiffies(
+	                                         EN7572_READY_POLL_WINDOW_MS)))
+		delay = EN7572_READY_POLL_IDLE_MS;
+	else
+		delay = EN7572_READY_POLL_MS;
+
+	schedule_delayed_work(&en->ready_work, msecs_to_jiffies(delay));
+}
+
 /* Dump the registers prepare() commits, to see them change behind our back. */
 static void en7572_log_analog(struct en7572 *en, const char *why)
 {
@@ -870,6 +936,8 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
+	WRITE_ONCE(en->tx_ready_state, false);
+	cancel_delayed_work(&en->ready_work);
 
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
 	                         EN7572_BEN_MODE_OFF);
@@ -1078,8 +1146,13 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 			if (en->tx_disable)
 				gpiod_set_value_cansleep(en->tx_disable, 0);
 			en->tx_gate_enabled = true;
+			/* A fresh gate starts dark until the analog path reports in. */
+			en->gate_opened = jiffies;
+			WRITE_ONCE(en->tx_ready_state, false);
+			mod_delayed_work(system_wq, &en->ready_work, 0);
 			/* Sample the burst path while it is supposed to be alive. */
 			en->sample_shot = 0;
+			en->tx_recommit = 0;
 			mod_delayed_work(
 				system_wq, &en->sample_work,
 				msecs_to_jiffies(en7572_sample_ms[0]));
@@ -1089,6 +1162,8 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 		if (en->tx_disable)
 			gpiod_set_value_cansleep(en->tx_disable, 1);
 		en->tx_gate_enabled = false;
+		WRITE_ONCE(en->tx_ready_state, false);
+		cancel_delayed_work(&en->ready_work);
 		ret = en7572_update_bits(en, EN7572_BEN_CTRL,
 		                         EN7572_BEN_MODE_MASK,
 		                         EN7572_BEN_MODE_OFF);
@@ -1109,6 +1184,8 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
 		gpiod_set_value_cansleep(en->tx_disable, 1);
 	en->tx_gate_enabled = false;
 	en->prepared = false;
+	WRITE_ONCE(en->tx_ready_state, false);
+	cancel_delayed_work(&en->ready_work);
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
 	                         EN7572_BEN_MODE_OFF);
 	mutex_unlock(&en->lock);
@@ -1124,6 +1201,7 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
  */
 static int en7572_tx_recommit(struct en7572 *en)
 {
+	unsigned int attempts = en->tx_recommit;
 	int ret;
 
 	ret = en7572_set_tx_enable(&en->frontend, false);
@@ -1137,7 +1215,11 @@ static int en7572_tx_recommit(struct en7572 *en)
 	if (ret)
 		return ret;
 
-	return en7572_set_tx_enable(&en->frontend, true);
+	ret = en7572_set_tx_enable(&en->frontend, true);
+	/* The re-enable starts a new sample epoch but not a new retry budget. */
+	en->tx_recommit = attempts;
+
+	return ret;
 }
 
 static int en7572_reset(struct airoha_pon_frontend *frontend)
@@ -1158,6 +1240,8 @@ static int en7572_reset(struct airoha_pon_frontend *frontend)
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
+	WRITE_ONCE(en->tx_ready_state, false);
+	cancel_delayed_work(&en->ready_work);
 	if (en->tx_disable)
 		gpiod_set_value_cansleep(en->tx_disable, 1);
 	/* Do not let a stale readiness result span the firmware reload. */
@@ -1187,6 +1271,7 @@ static const struct airoha_pon_frontend_ops en7572_frontend_ops = {
 	.get_diagnostics = en7572_get_diagnostics,
 	.get_link_config = en7572_get_link_config,
 	.set_tx_enable = en7572_set_tx_enable,
+	.tx_ready = en7572_tx_ready_cached,
 };
 
 static int en7572_probe(struct i2c_client *client)
@@ -1217,6 +1302,7 @@ static int en7572_probe(struct i2c_client *client)
 	en->program = client;
 	mutex_init(&en->lock);
 	INIT_DELAYED_WORK(&en->sample_work, en7572_sample_work);
+	INIT_DELAYED_WORK(&en->ready_work, en7572_ready_work);
 	/* GPIO descriptors translate logical assertion to board-level polarity. */
 	en->tx_disable =
 		devm_gpiod_get_optional(dev, "tx-disable", GPIOD_OUT_HIGH);
@@ -1315,6 +1401,7 @@ static void en7572_remove(struct i2c_client *client)
 
 	airoha_pon_frontend_unregister(frontend);
 	cancel_delayed_work_sync(&en->sample_work);
+	cancel_delayed_work_sync(&en->ready_work);
 	/* Close the external TX path before the internal BEN gate. */
 	mutex_lock(&en->lock);
 	if (en->tx_disable)

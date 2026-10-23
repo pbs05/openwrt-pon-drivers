@@ -135,6 +135,12 @@ struct airoha_pon_frontend_ops {
 	                       struct airoha_pon_frontend_link_config *config);
 	int (*set_tx_enable)(struct airoha_pon_frontend *frontend, bool enable);
 	/*
+	 * Optional. Cached readiness of the TX path, refreshed by the provider's
+	 * own poller. It is read from hard IRQ context, so it must not sleep and
+	 * must not touch the bus. Missing callback means "always ready".
+	 */
+	bool (*tx_ready)(struct airoha_pon_frontend *frontend);
+	/*
 	 * Optional. Providers that run firmware on a local core can wedge while
 	 * every register stays reachable. reset() reloads that firmware; the
 	 * caller re-runs prepare() before the burst gate is opened again.
@@ -180,6 +186,7 @@ int airoha_pon_frontend_get_link_config(
 	struct airoha_pon_frontend_link_config *config);
 int airoha_pon_frontend_set_tx_enable(struct airoha_pon_frontend *frontend,
                                       bool enable);
+bool airoha_pon_frontend_tx_ready(struct airoha_pon_frontend *frontend);
 int airoha_pon_frontend_reset(struct airoha_pon_frontend *frontend);
 
 #endif /* __AIROHA_PON_FRONTEND_H */

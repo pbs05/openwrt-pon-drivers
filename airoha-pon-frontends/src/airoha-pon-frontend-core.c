@@ -196,6 +196,15 @@ int airoha_pon_frontend_set_tx_enable(struct airoha_pon_frontend *frontend,
 }
 EXPORT_SYMBOL_GPL(airoha_pon_frontend_set_tx_enable);
 
+bool airoha_pon_frontend_tx_ready(struct airoha_pon_frontend *frontend)
+{
+	if (!frontend || !frontend->ops->tx_ready)
+		return true;
+
+	return frontend->ops->tx_ready(frontend);
+}
+EXPORT_SYMBOL_GPL(airoha_pon_frontend_tx_ready);
+
 int airoha_pon_frontend_reset(struct airoha_pon_frontend *frontend)
 {
 	if (!frontend->ops->reset)

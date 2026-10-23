@@ -122,7 +122,12 @@
 	 AIROHA_EPON_INT_REGISTER_ACK_DONE)
 
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
-#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
+/*
+ * Discovery Gates to skip while the optical TX path reports not ready. Bounded
+ * so a permanently dark path still reaches the recovery ladder through the
+ * normal MPCP timeout instead of stalling in discovery.
+ */
+#define AIROHA_EPON_TX_DEFER_LIMIT 3#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
 #define AIROHA_EPON_DISCOVERY_COMMAND        GENMASK(31, 30)
@@ -387,6 +392,7 @@ static void airoha_xpon_epon_reset_registration(struct airoha_xpon *xpon)
 	xpon->epon.llid = 0;
 	xpon->epon.llid_valid = false;
 	xpon->epon.discovery_retry = 0;
+	xpon->epon.tx_deferrals = 0;
 	xpon->epon.denied_until = 0;
 	xpon->epon.mpcp_state = AIROHA_EPON_MPCP_REGISTERING;
 	xpon->lifecycle = AIROHA_XPON_PROTOCOL_ACTIVATING;
@@ -820,7 +826,27 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 		            AIROHA_EPON_MPCP_REGISTERED &&
 		    READ_ONCE(xpon->epon.mpcp_state) !=
 		            AIROHA_EPON_MPCP_DENIED) {
-			airoha_xpon_epon_send_register_request_fast(xpon);
+			/*
+			 * The optical path needs a moment to report TX ready after
+			 * the gate opens. Answering the Gate before that loses the
+			 * Register Request and wedges the discovery state machine,
+			 * while missing one Gate costs only the OLT's next grant.
+			 */
+			if (!airoha_pon_frontend_tx_ready(xpon->frontend) &&
+			    READ_ONCE(xpon->epon.tx_deferrals) <
+			            AIROHA_EPON_TX_DEFER_LIMIT) {
+				unsigned int deferrals =
+					READ_ONCE(xpon->epon.tx_deferrals) + 1;
+
+				WRITE_ONCE(xpon->epon.tx_deferrals, deferrals);
+				if (deferrals == 1)
+					dev_info(xpon->dev,
+					         "TX path not ready, deferring the Register Request to the next Discovery Gate (up to %u)\n",
+					         AIROHA_EPON_TX_DEFER_LIMIT);
+			} else {
+				WRITE_ONCE(xpon->epon.tx_deferrals, 0);
+				airoha_xpon_epon_send_register_request_fast(xpon);
+			}
 		}
 	}
 

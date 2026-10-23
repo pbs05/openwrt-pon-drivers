@@ -385,6 +385,8 @@ static int pon_frontend_debug_show(struct seq_file *m, void *unused)
 	if (!ret) {
 		seq_printf(m, "tx_gate_enabled: %d\n",
 		           diagnostics.tx_gate_enabled);
+		seq_printf(m, "tx_path_ready: %d\n",
+		           airoha_pon_frontend_tx_ready(xpon->frontend));
 		if (diagnostics.valid & AIROHA_PON_FRONTEND_DIAG_TEMPERATURE)
 			seq_printf(m, "temperature_8472: 0x%04x\n",
 			           (u16)diagnostics.temperature);
