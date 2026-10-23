@@ -73,6 +73,11 @@ struct airoha_xpon_epon {
 	bool llid_valid;
 	bool pcs_synced;
 	bool discovery_seen;
+	/*
+	 * The burst path has carried a Register Request to the OLT at least once
+	 * in this session. Only then does the TX-ready flag predict anything.
+	 */
+	bool ever_registered;
 	unsigned long denied_until;
 	/* Hard IRQ updates these values; readers use atomic_read(). */
 	atomic_t discovery_gate_count;
@@ -83,6 +88,11 @@ struct airoha_xpon_epon {
 	 * the MAC discovery state machine, so the gate is deferred instead.
 	 */
 	unsigned int tx_deferrals;
+	/*
+	 * Register Requests sent since the OLT last answered with any MPCP
+	 * message. Silence across several requests is the cold-start wedge.
+	 */
+	unsigned int requests_since_message;
 	unsigned int register_message_count;
 	unsigned int register_ack_count;
 	unsigned int nack_count;

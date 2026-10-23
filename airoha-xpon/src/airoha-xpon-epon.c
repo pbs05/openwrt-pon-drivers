@@ -123,13 +123,17 @@
 
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
 /*
- * Discovery Gates to skip while the optical TX path reports not ready. The
- * analog path needs two to four seconds on this hardware, and one Gate per
- * second, so six covers a full cold warm-up. Bounded so a permanently dark
- * path still reaches the recovery ladder through the normal MPCP timeout
- * instead of stalling in discovery.
+ * Discovery Gates to skip while the optical TX path reports not ready.
+ *
+ * The readiness flag is latched by the first successful burst, so on a cold
+ * start it is necessarily clear and deferring would burn Gates without any
+ * evidence that the path is dark. The stock firmware answers the very first
+ * Gate and relies on the Gate cadence for retries, so do the same. Only a
+ * line that has already registered once may skip a single Gate: at that point
+ * the flag carries information, and one Gate covers the re-arm settle time.
  */
-#define AIROHA_EPON_TX_DEFER_LIMIT 6#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
+#define AIROHA_EPON_TX_DEFER_LIMIT 1
+#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
 #define AIROHA_EPON_DISCOVERY_COMMAND        GENMASK(31, 30)
@@ -152,6 +156,15 @@
 #define AIROHA_EPON_DISCOVERY_SYNC_UPDATE BIT(24)
 #define AIROHA_EPON_DISCOVERY_RETRY_COUNT 3
 #define AIROHA_EPON_NACK_SILENT_MS        60000
+/*
+ * Register Requests in a row that drew no MPCP message from the OLT at all.
+ * A healthy cold start gets an ACK or a Deregister within two grants, so pure
+ * silence means the bursts never reached the fibre and the MAC discovery state
+ * machine latched. The unregistered MPCP timeout path escalates on this count
+ * instead of retrying forever; measured on this hardware the first burst of a
+ * cold module is occasionally dark even though the optics reports no fault.
+ */
+#define AIROHA_EPON_DISCOVERY_SILENT_REQUESTS 3
 /*
  * A registered ONU that misses this many consecutive MPCP grants is not being
  * outvoted by the OLT: its burst engine stopped reaching the fibre. The EN7572
@@ -312,6 +325,8 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           "mac_errors: %u\n"
 	           "last_mac_error: 0x%08x\n"
 	           "registered_timeout_streak: %u\n"
+	           "unanswered_requests: %u\n"
+	           "ever_registered: %u\n"
 	           "burst_rearms: %u\n"
 	           "frontend_reloads: %u\n",
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
@@ -328,6 +343,8 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           airoha_epon_read(xpon, AIROHA_EPON_RX_OAM_COUNT),
 	           xpon->epon.mac_error_count, xpon->epon.last_mac_error,
 	           xpon->epon.registered_timeout_streak,
+	           READ_ONCE(xpon->epon.requests_since_message),
+	           xpon->epon.ever_registered,
 	           xpon->epon.tx_rearm_count,
 	           xpon->epon.frontend_reset_count);
 }
@@ -710,6 +727,8 @@ airoha_xpon_epon_send_register_request_fast(struct airoha_xpon *xpon)
 	 */
 	/* writel() orders timestamp and state updates before the MPCP command. */
 	airoha_epon_write(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL, command);
+	WRITE_ONCE(xpon->epon.requests_since_message,
+	           READ_ONCE(xpon->epon.requests_since_message) + 1);
 	atomic_inc(&xpon->epon.register_request_count);
 }
 
@@ -721,6 +740,8 @@ static void airoha_xpon_epon_handle_register(struct airoha_xpon *xpon)
 
 	xpon->epon.last_register_status = status;
 	xpon->epon.register_message_count++;
+	/* Any MPCP message proves the burst reached the OLT. */
+	WRITE_ONCE(xpon->epon.requests_since_message, 0);
 	if (flag == AIROHA_EPON_REGISTER_DEREGISTER) {
 		xpon->epon.deregister_count++;
 		dev_info(xpon->dev, "EPON deregister received: status=0x%08x\n",
@@ -776,6 +797,8 @@ static void airoha_xpon_epon_complete_registration(struct airoha_xpon *xpon)
 
 	xpon->epon.mpcp_state = AIROHA_EPON_MPCP_REGISTERED;
 	xpon->epon.register_ack_count++;
+	xpon->epon.ever_registered = true;
+	xpon->epon.requests_since_message = 0;
 	xpon->epon.registered_since = jiffies;
 	xpon->data_path.configured = true;
 	xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
@@ -829,12 +852,15 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 		    READ_ONCE(xpon->epon.mpcp_state) !=
 		            AIROHA_EPON_MPCP_DENIED) {
 			/*
-			 * The optical path needs a moment to report TX ready after
-			 * the gate opens. Answering the Gate before that loses the
-			 * Register Request and wedges the discovery state machine,
-			 * while missing one Gate costs only the OLT's next grant.
+			 * Only a line that has already carried a Register Request to
+			 * the OLT may defer. The ready flag is latched by the first
+			 * successful burst, so on a cold start it is always clear and
+			 * deferring would discard Gates on no evidence at all: the
+			 * first Gate is answered immediately, exactly like the stock
+			 * firmware, and a dark burst is left to the re-arm ladder.
 			 */
-			if (!airoha_pon_frontend_tx_ready(xpon->frontend) &&
+			if (READ_ONCE(xpon->epon.ever_registered) &&
+			    !airoha_pon_frontend_tx_ready(xpon->frontend) &&
 			    READ_ONCE(xpon->epon.tx_deferrals) <
 			            AIROHA_EPON_TX_DEFER_LIMIT) {
 				unsigned int deferrals =
@@ -925,6 +951,28 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 			}
 		} else {
 			xpon->epon.registered_timeout_streak = 0;
+			/*
+			 * Still in discovery. A cold module can emit nothing on the
+			 * first grants, and the MAC then latches its discovery state
+			 * machine: every later Gate is ignored and the 1 s timeout
+			 * merely repeats. Silence across several answered Gates is the
+			 * only evidence the driver has, so escalate the same re-arm
+			 * ladder a registered wedge uses. Before this, only a line that
+			 * had already registered could ever recover.
+			 */
+			if (xpon->epon.mpcp_state != AIROHA_EPON_MPCP_DENIED &&
+			    READ_ONCE(xpon->epon.requests_since_message) >=
+			            AIROHA_EPON_DISCOVERY_SILENT_REQUESTS) {
+				unsigned int silent =
+					READ_ONCE(xpon->epon.requests_since_message);
+
+				WRITE_ONCE(xpon->epon.requests_since_message, 0);
+				dev_warn(xpon->dev,
+				         "EPON discovery wedged: %u unanswered Register Requests, no MPCP message from the OLT; re-arming the burst path\n",
+				         silent);
+				xpon->epon.frontend_reset_pending = true;
+				mod_delayed_work(system_wq, &xpon->link_work, 0);
+			}
 		}
 		dev_warn_ratelimited(
 			xpon->dev,
@@ -1018,15 +1066,21 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	if (!xpon->epon.frontend_reset_pending && !forced)
 		return 0;
 
-	xpon->epon.frontend_reset_pending = false;
-	xpon->epon.frontend_reset_forced = false;
-
-	if (!xpon->tx_armed || !airoha_xpon_mode_is_epon(xpon->active_mode))
+	if (!xpon->tx_armed || !airoha_xpon_mode_is_epon(xpon->active_mode)) {
+		xpon->epon.frontend_reset_pending = false;
+		xpon->epon.frontend_reset_forced = false;
 		return 0;
+	}
 
-	/* A real OLT-side fault must not turn the reload into a reset loop. */
+	/*
+	 * Keep the request pending across the cooldown. Consuming it here would
+	 * silently drop a recovery the timeout path has already asked for.
+	 */
 	if (!forced && time_before(jiffies, xpon->epon.frontend_reset_after))
 		return 0;
+
+	xpon->epon.frontend_reset_pending = false;
+	xpon->epon.frontend_reset_forced = false;
 
 	mode = airoha_xpon_mode_info(xpon->active_mode);
 	if (!mode)
@@ -1036,8 +1090,9 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	airoha_pon_frontend_get_diagnostics(xpon->frontend, &diagnostics);
 
 	dev_warn(xpon->dev,
-	         "EPON burst engine wedged: %u MPCP timeouts while registered (llid=0x%04x state=%u int=0x%08x dsc=0x%08x rx_mpcp=%u rx_oam=%u tx_bias=0x%04x tx_power=0x%04x); recovering the burst path\n",
-	         xpon->epon.registered_timeout_streak, xpon->epon.llid,
+	         "EPON burst path wedged: %u registered timeouts, %u unanswered Register Requests (llid=0x%04x state=%u int=0x%08x dsc=0x%08x rx_mpcp=%u rx_oam=%u tx_bias=0x%04x tx_power=0x%04x); recovering the burst path\n",
+	         xpon->epon.registered_timeout_streak,
+	         xpon->epon.requests_since_message, xpon->epon.llid,
 	         xpon->epon.mpcp_state,
 	         airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
 	         airoha_epon_read(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL),
@@ -1072,6 +1127,7 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 		}
 
 		xpon->epon.registered_timeout_streak = 0;
+		xpon->epon.requests_since_message = 0;
 		xpon->epon.frontend_reset_after =
 			jiffies + msecs_to_jiffies(AIROHA_EPON_TX_REARM_RETRY_MS);
 
@@ -1110,6 +1166,7 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	}
 
 	xpon->epon.registered_timeout_streak = 0;
+	xpon->epon.requests_since_message = 0;
 	xpon->epon.tx_rearm_count = 0;
 	xpon->epon.frontend_reload_forced = false;
 	xpon->epon.frontend_reset_after =
