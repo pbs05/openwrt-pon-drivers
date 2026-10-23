@@ -70,6 +70,17 @@
 #define EN7572_SYSTEM_STATUS_REG     0x0488
 
 /*
+ * SYSTEM_STATUS bit 0 follows the transmitter, not the host gate: it stays
+ * clear while the analog TX path emits nothing even though bias current is
+ * already commanded, whereas every DDMI channel keeps its last value. It is
+ * therefore the only reliable "is the laser actually on" signal on this part.
+ */
+#define EN7572_SYS_TX_READY          BIT(0)
+
+/* Calibration rewrites allowed before a dark path is left to the xpon ladder. */
+#define EN7572_TX_RECOMMIT_LIMIT     2
+
+/*
  * The stock runtime restores these 40 bytes when the threshold table is
  * erased. Address 0x51 is volatile; per-device BOB remains in board storage.
  */
@@ -128,6 +139,7 @@ struct en7572 {
 	/* Post-enable captures that show how the TX path evolves after a burst. */
 	struct delayed_work sample_work;
 	unsigned int sample_shot;
+	unsigned int tx_recommit;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -644,10 +656,40 @@ static void en7572_log_state(struct en7572 *en, const char *tag)
 	         en->tx_gate_enabled);
 }
 
-/* Sample offsets after the burst gate opens; the wedge shows up within a second. */
-static const unsigned int en7572_sample_ms[] = { 250, 1000, 2000 };
-static const char *const en7572_sample_tag[] = { "tx+0.25s", "tx+1.25s",
-                                                 "tx+3.25s" };
+/*
+ * The first capture waits for the APC loop: a healthy line reports TX ready
+ * within a second of the gate opening, and DDMI only refreshes once a second.
+ */
+static const unsigned int en7572_sample_ms[] = { 2000, 2000, 4000 };
+static const char *const en7572_sample_tag[] = { "tx+2.0s", "tx+4.0s",
+                                                 "tx+8.0s" };
+
+static int en7572_tx_recommit(struct en7572 *en);
+
+static bool en7572_tx_ready(struct en7572 *en)
+{
+	u32 sys = 0;
+
+	if (en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys))
+		return true;	/* never flap the line over a single read error */
+
+	return !!(sys & EN7572_SYS_TX_READY);
+}
+
+/* Dump the registers prepare() commits, to see them change behind our back. */
+static void en7572_log_analog(struct en7572 *en, const char *why)
+{
+	u32 dcl = 0, loop = 0, vmon = 0;
+
+	if (en7572_read_u32(en->runtime, EN7572_DCL_CTRL_2, &dcl) ||
+	    en7572_read_u32(en->runtime, EN7572_LOOP_CTRL, &loop) ||
+	    en7572_read_u32(en->runtime, EN7572_APC_ANA_VMON_SEL, &vmon))
+		return;
+
+	dev_warn(&en->program->dev,
+	         "state[%s] dcl_ctrl_2=0x%08x loop_ctrl=0x%08x vmon_sel=0x%08x\n",
+	         why, dcl, loop, vmon);
+}
 
 static void en7572_sample_work(struct work_struct *work)
 {
@@ -659,6 +701,35 @@ static void en7572_sample_work(struct work_struct *work)
 		return;
 
 	en7572_log_state(en, en7572_sample_tag[shot]);
+
+	/*
+	 * Only the first capture says anything about the burst path: it is taken
+	 * while a working laser must already report ready. If it does not, the
+	 * calibration commit was lost - typically to the MD32 core finishing its
+	 * own initialisation after prepare() ran - and the line is dark although
+	 * the gate is open and bias is commanded. Re-committing the calibration
+	 * is what clears it; reloading the firmware does not, and leaves the line
+	 * dark about one time in five.
+	 */
+	if (!shot && en->tx_gate_enabled) {
+		if (en7572_tx_ready(en)) {
+			en->tx_recommit = 0;
+		} else if (en->tx_recommit < EN7572_TX_RECOMMIT_LIMIT) {
+			en->tx_recommit++;
+			en7572_log_analog(en, "tx-dark");
+			dev_warn(&en->program->dev,
+			         "TX path not ready %u ms after the gate opened, re-committing the calibration (%u of %u)\n",
+			         en7572_sample_ms[0], en->tx_recommit,
+			         EN7572_TX_RECOMMIT_LIMIT);
+			if (!en7572_tx_recommit(en))
+				return;	/* the recommit restarted sampling */
+		} else {
+			dev_err(&en->program->dev,
+			        "TX path still dark after %u calibration commits, leaving it to the xpon recovery ladder\n",
+			        EN7572_TX_RECOMMIT_LIMIT);
+		}
+	}
+
 	en->sample_shot = shot + 1;
 	if (en->sample_shot < ARRAY_SIZE(en7572_sample_ms))
 		schedule_delayed_work(
@@ -666,41 +737,67 @@ static void en7572_sample_work(struct work_struct *work)
 			msecs_to_jiffies(en7572_sample_ms[en->sample_shot]));
 }
 
-/* A stopped MD32 keeps the I2C window alive but stops refreshing its version. */
-static bool en7572_md32_started(struct en7572 *en)
+/*
+ * The firmware version register says nothing about whether the core runs: it
+ * is a chip constant that reads 0x2a even with MD32 halted. The DDMI block is
+ * the only state the firmware itself publishes, and it sits at its reset
+ * defaults until the core starts refreshing it. Waiting for the first change
+ * also means the core has finished writing the analog registers prepare()
+ * owns, which is exactly the race that leaves a recovered line dark.
+ */
+static int en7572_wait_md32(struct en7572 *en)
 {
-	u8 fw;
-	int ret;
+	u16 temp, vcc, rssi;
+	u16 ref_temp = 0, ref_vcc = 0, ref_rssi = 0;
+	int waited;
 
-	ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG, &fw, sizeof(fw));
-	if (ret)
-		return false;
+	en7572_read_be16(en->runtime, EN7572_TEMPERATURE_REG, &ref_temp);
+	en7572_read_be16(en->runtime, EN7572_VOLTAGE_REG, &ref_vcc);
+	en7572_read_u16(en->runtime, EN7572_RSSI_ADC_REG, &ref_rssi);
 
-	return fw != 0x00 && fw != 0xff;
+	for (waited = 100; waited <= 5000; waited += 100) {
+		msleep(100);
+		temp = ref_temp;
+		vcc = ref_vcc;
+		rssi = ref_rssi;
+		en7572_read_be16(en->runtime, EN7572_TEMPERATURE_REG, &temp);
+		en7572_read_be16(en->runtime, EN7572_VOLTAGE_REG, &vcc);
+		en7572_read_u16(en->runtime, EN7572_RSSI_ADC_REG, &rssi);
+		if (temp != ref_temp || vcc != ref_vcc || rssi != ref_rssi)
+			return waited;
+	}
+
+	return -ETIMEDOUT;
 }
 
 static int en7572_start_md32(struct en7572 *en, const char *why)
 {
-	int attempt, ret;
+	int attempt, ret, waited;
 
-	for (attempt = 1; attempt <= 3; attempt++) {
+	for (attempt = 1; attempt <= 2; attempt++) {
 		ret = en7572_initialize_md32(en);
 		if (ret)
 			return ret;
-		if (en7572_md32_started(en))
+
+		waited = en7572_wait_md32(en);
+		if (waited >= 0) {
+			dev_info(&en->program->dev,
+			         "MD32 started %d ms after the image load on %s\n",
+			         waited, why);
 			return 0;
+		}
+
 		dev_warn(&en->program->dev,
-		         "MD32 reported no firmware version on %s (attempt %d of 3)\n",
+		         "MD32 never refreshed DDMI on %s (attempt %d of 2), reloading the images\n",
 		         why, attempt);
 	}
 
 	/*
-	 * Some modules only publish their version once the line is up, so a
-	 * missing value here is not fatal: prepare() and the recovery path
-	 * still get their chance to bring the burst engine back.
+	 * Keep the device bound: the recovery ladder retries, and the frontend
+	 * readiness check catches a dark path as soon as the gate is opened.
 	 */
-	dev_info(&en->program->dev,
-	         "MD32 version still unreadable on %s, continuing\n", why);
+	dev_err(&en->program->dev,
+	        "MD32 did not start on %s, continuing\n", why);
 	return 0;
 }
 
@@ -963,6 +1060,14 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 	if (enable && !en->prepared)
 		return -EAGAIN;
 
+	/*
+	 * Capture the burst path while it still looks like the last burst left
+	 * it. Once TX_DISABLE is asserted every register reads like a cleanly
+	 * stopped module, which is why a wedged line stayed invisible.
+	 */
+	if (!enable && en->tx_gate_enabled)
+		en7572_log_state(en, "gate-off");
+
 	mutex_lock(&en->lock);
 	if (enable) {
 		/* Enter burst mode before releasing the board TX_DISABLE gate. */
@@ -1011,6 +1116,30 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
 	return ret;
 }
 
+/*
+ * Re-run the host half of the TX enable sequence on a path that is gated on
+ * but reports no light: close the gate, rewrite the calibration and pulse
+ * rg_loop_en, then open the gate again. Sampling restarts from the first
+ * offset so the result is captured like any other enable.
+ */
+static int en7572_tx_recommit(struct en7572 *en)
+{
+	int ret;
+
+	ret = en7572_set_tx_enable(&en->frontend, false);
+	if (ret)
+		return ret;
+
+	/* Let the burst gate and the board TX_DISABLE pin settle first. */
+	usleep_range(5000, 6000);
+
+	ret = en7572_prepare(&en->frontend, en->prepared_mode);
+	if (ret)
+		return ret;
+
+	return en7572_set_tx_enable(&en->frontend, true);
+}
+
 static int en7572_reset(struct airoha_pon_frontend *frontend)
 {
 	struct en7572 *en = airoha_pon_frontend_priv(frontend);
@@ -1018,19 +1147,21 @@ static int en7572_reset(struct airoha_pon_frontend *frontend)
 	int ret;
 
 	/*
-	 * A wedged module still answers every I2C access, but its APC loop has
-	 * stopped: bias current keeps flowing while no light leaves the fibre.
-	 * prepare() only rewrites calibration codes, so rebinding the consumer
-	 * driver cannot clear this; the MD32 firmware has to be reloaded and
-	 * restarted from the PM/DM/BOB images captured at probe time.
+	 * Last resort for a burst path that will not come back. Note that this
+	 * reloads the MD32 images but does not by itself restore the analog TX
+	 * path: on this hardware the driver has to rewrite the calibration and
+	 * re-pulse rg_loop_en afterwards, which prepare() does. The caller does
+	 * that, and the frontend readiness check verifies the result.
 	 */
-	en7572_log_state(en, "wedged");
+	en7572_log_state(en, "reload-start");
 
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
 	if (en->tx_disable)
 		gpiod_set_value_cansleep(en->tx_disable, 1);
+	/* Do not let a stale readiness result span the firmware reload. */
+	en->tx_recommit = 0;
 	ret = en7572_start_md32(en, "recovery");
 	if (!ret)
 		ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG,

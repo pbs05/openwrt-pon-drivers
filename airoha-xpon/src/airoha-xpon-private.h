@@ -93,7 +93,14 @@ struct airoha_xpon_epon {
 	 */
 	bool frontend_reset_pending;
 	bool frontend_reset_forced;
+	bool frontend_reload_forced;
 	unsigned int registered_timeout_streak;
+	/*
+	 * Gate re-arms already spent on this wedge. Re-arming is repeated before
+	 * the firmware reload because the reload is the step that can come back
+	 * dark on this hardware.
+	 */
+	unsigned int tx_rearm_count;
 	unsigned int frontend_reset_count;
 	unsigned long frontend_reset_after;
 	unsigned long registered_since;

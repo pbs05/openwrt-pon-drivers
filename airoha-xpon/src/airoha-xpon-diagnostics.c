@@ -648,8 +648,11 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 DEFINE_SHOW_ATTRIBUTE(pon_registration_debug);
 
 /*
- * One forced TX-lane recovery, used to exercise the reload path on a healthy
- * line instead of waiting for a wedge: echo 1 > .../recover_tx
+ * One forced TX-lane recovery, used to exercise the path on a healthy line
+ * instead of waiting for a wedge:
+ *
+ *   echo 1 > .../recover_tx   re-arm the burst path (stage 1)
+ *   echo 2 > .../recover_tx   reload the frontend firmware (stage 2)
  */
 static ssize_t pon_recover_tx_write(struct file *file,
                                     const char __user *user_buf, size_t count,
@@ -663,10 +666,14 @@ static ssize_t pon_recover_tx_write(struct file *file,
 	if (copy_from_user(input, user_buf, count))
 		return -EFAULT;
 	input[count] = '\0';
-	if (input[0] != '1' && input[0] != 'y' && input[0] != 'Y')
+
+	if (input[0] == '2')
+		WRITE_ONCE(xpon->epon.frontend_reload_forced, true);
+	else if (input[0] == '1' || input[0] == 'y' || input[0] == 'Y')
+		WRITE_ONCE(xpon->epon.frontend_reset_forced, true);
+	else
 		return -EINVAL;
 
-	WRITE_ONCE(xpon->epon.frontend_reset_forced, true);
 	mod_delayed_work(system_wq, &xpon->link_work, 0);
 	return count;
 }

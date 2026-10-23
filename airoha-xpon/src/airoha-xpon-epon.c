@@ -154,6 +154,12 @@
 #define AIROHA_EPON_TX_WEDGE_TIMEOUTS     3
 #define AIROHA_EPON_TX_WEDGE_EPOCH_MS     5000
 #define AIROHA_EPON_TX_WEDGE_RETRY_MS     30000
+/*
+ * Re-arming only repeats the frontend's prepare() cycle, so it can be tried
+ * before the firmware reload that is the step which can come back dark.
+ */
+#define AIROHA_EPON_TX_REARM_ATTEMPTS     2
+#define AIROHA_EPON_TX_REARM_RETRY_MS     15000
 /* The standard MAC path starts at 0x20; OLT values are capped at 0x5f. */
 #define AIROHA_EPON_SYNC_TIME_DEFAULT    0x20
 #define AIROHA_EPON_SYNC_TIME_MAX        0x5f
@@ -299,6 +305,7 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           "mac_errors: %u\n"
 	           "last_mac_error: 0x%08x\n"
 	           "registered_timeout_streak: %u\n"
+	           "burst_rearms: %u\n"
 	           "frontend_reloads: %u\n",
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
 	           airoha_epon_read(xpon, AIROHA_EPON_INT_ENABLE),
@@ -314,6 +321,7 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           airoha_epon_read(xpon, AIROHA_EPON_RX_OAM_COUNT),
 	           xpon->epon.mac_error_count, xpon->epon.last_mac_error,
 	           xpon->epon.registered_timeout_streak,
+	           xpon->epon.tx_rearm_count,
 	           xpon->epon.frontend_reset_count);
 }
 
@@ -877,8 +885,10 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 			 */
 			if (jiffies_to_msecs(jiffies -
 			                     xpon->epon.registered_since) >
-			    AIROHA_EPON_TX_WEDGE_EPOCH_MS)
+			    AIROHA_EPON_TX_WEDGE_EPOCH_MS) {
 				xpon->epon.registered_timeout_streak = 0;
+				xpon->epon.tx_rearm_count = 0;
+			}
 			xpon->epon.registered_timeout_streak++;
 			if (xpon->epon.registered_timeout_streak >=
 			    AIROHA_EPON_TX_WEDGE_TIMEOUTS) {
@@ -973,7 +983,8 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 {
 	struct airoha_pon_frontend_diagnostics diagnostics = {};
 	const struct airoha_xpon_mode_info *mode;
-	bool forced = xpon->epon.frontend_reset_forced;
+	bool forced = xpon->epon.frontend_reset_forced ||
+	              xpon->epon.frontend_reload_forced;
 	int ret;
 
 	if (!xpon->epon.frontend_reset_pending && !forced)
@@ -997,7 +1008,7 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	airoha_pon_frontend_get_diagnostics(xpon->frontend, &diagnostics);
 
 	dev_warn(xpon->dev,
-	         "EPON burst engine wedged: %u MPCP timeouts while registered (llid=0x%04x state=%u int=0x%08x dsc=0x%08x rx_mpcp=%u rx_oam=%u tx_bias=0x%04x tx_power=0x%04x); reloading optical frontend\n",
+	         "EPON burst engine wedged: %u MPCP timeouts while registered (llid=0x%04x state=%u int=0x%08x dsc=0x%08x rx_mpcp=%u rx_oam=%u tx_bias=0x%04x tx_power=0x%04x); recovering the burst path\n",
 	         xpon->epon.registered_timeout_streak, xpon->epon.llid,
 	         xpon->epon.mpcp_state,
 	         airoha_epon_read(xpon, AIROHA_EPON_INT_STATUS),
@@ -1009,8 +1020,48 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	airoha_xpon_epon_stop_rx(xpon);
 
 	/*
-	 * Providers without firmware cannot reload anything, and the PCS restart
-	 * below is the only recovery they have.
+	 * Stage 1: repeat the gate-off/prepare/gate-on cycle without touching
+	 * the firmware. Measured on this hardware, that restores a wedged line
+	 * every time, while reloading the MD32 images brings the line back dark
+	 * about one attempt in five, so the reload is only the escalation.
+	 * The frontend re-commits the calibration itself when the chip does not
+	 * report TX ready afterwards, which covers the same fault one second
+	 * after the gate opens instead of three MPCP periods later.
+	 */
+	if (!xpon->epon.frontend_reload_forced &&
+	    xpon->epon.tx_rearm_count < AIROHA_EPON_TX_REARM_ATTEMPTS) {
+		xpon->epon.tx_rearm_count++;
+		ret = airoha_pon_frontend_prepare(xpon->frontend,
+		                                  mode->frontend_mode);
+		if (ret) {
+			dev_err(xpon->dev,
+			        "re-arming the EPON burst path failed: %d\n",
+			        ret);
+			xpon->epon.frontend_reset_after =
+				jiffies + msecs_to_jiffies(
+				AIROHA_EPON_TX_REARM_RETRY_MS);
+			return ret;
+		}
+
+		xpon->epon.registered_timeout_streak = 0;
+		xpon->epon.frontend_reset_after =
+			jiffies + msecs_to_jiffies(AIROHA_EPON_TX_REARM_RETRY_MS);
+
+		ret = airoha_xpon_epon_start_rx(xpon);
+		if (ret)
+			return ret;
+
+		dev_info(xpon->dev,
+		         "EPON burst path re-armed (%u of %u) without reloading the optical firmware\n",
+		         xpon->epon.tx_rearm_count,
+		         AIROHA_EPON_TX_REARM_ATTEMPTS);
+		return 0;
+	}
+
+	/*
+	 * Stage 2: reload the frontend firmware. Providers without one cannot
+	 * reload anything, and the PCS restart below is the only recovery they
+	 * have.
 	 */
 	ret = airoha_pon_frontend_reset(xpon->frontend);
 	if (ret == -EOPNOTSUPP) {
@@ -1031,6 +1082,8 @@ int airoha_xpon_epon_recover_tx(struct airoha_xpon *xpon)
 	}
 
 	xpon->epon.registered_timeout_streak = 0;
+	xpon->epon.tx_rearm_count = 0;
+	xpon->epon.frontend_reload_forced = false;
 	xpon->epon.frontend_reset_after =
 		jiffies + msecs_to_jiffies(AIROHA_EPON_TX_WEDGE_RETRY_MS);
 
