@@ -77,9 +77,6 @@
  */
 #define EN7572_SYS_TX_READY          BIT(0)
 
-/* Calibration rewrites allowed before a dark path is left to the xpon ladder. */
-#define EN7572_TX_RECOMMIT_LIMIT     2
-
 /*
  * The stock runtime restores these 40 bytes when the threshold table is
  * erased. Address 0x51 is volatile; per-device BOB remains in board storage.
@@ -139,7 +136,6 @@ struct en7572 {
 	/* Post-enable captures that show how the TX path evolves after a burst. */
 	struct delayed_work sample_work;
 	unsigned int sample_shot;
-	unsigned int tx_recommit;
 	/*
 	 * Readiness poll. The MAC may answer a Discovery Gate as soon as the
 	 * burst gate opens, but the analog path needs time to report TX ready.
@@ -674,8 +670,6 @@ static const unsigned int en7572_sample_ms[] = { 2000, 2000, 4000 };
 static const char *const en7572_sample_tag[] = { "tx+2.0s", "tx+4.0s",
                                                  "tx+8.0s" };
 
-static int en7572_tx_recommit(struct en7572 *en);
-
 static bool en7572_tx_ready(struct en7572 *en)
 {
 	u32 sys = 0;
@@ -687,7 +681,7 @@ static bool en7572_tx_ready(struct en7572 *en)
 }
 
 #define EN7572_READY_POLL_MS        20
-#define EN7572_READY_POLL_WINDOW_MS 3000
+#define EN7572_READY_POLL_WINDOW_MS 8000
 #define EN7572_READY_POLL_IDLE_MS   1000
 
 static bool en7572_tx_ready_cached(struct airoha_pon_frontend *frontend)
@@ -769,31 +763,27 @@ static void en7572_sample_work(struct work_struct *work)
 	en7572_log_state(en, en7572_sample_tag[shot]);
 
 	/*
-	 * Only the first capture says anything about the burst path: it is taken
-	 * while a working laser must already report ready. If it does not, the
-	 * calibration commit was lost - typically to the MD32 core finishing its
-	 * own initialisation after prepare() ran - and the line is dark although
-	 * the gate is open and bias is commanded. Re-committing the calibration
-	 * is what clears it; reloading the firmware does not, and leaves the line
-	 * dark about one time in five.
+	 * The captures only report. An earlier version re-committed the
+	 * calibration here whenever the first capture was dark, but two boots
+	 * showed the analog path needs about two to four seconds after the gate
+	 * opens, so a two second verdict lands inside the warm-up and the
+	 * re-commit restarts it. Measured cost of that misfire: 3.8 s of cold
+	 * start on both boots. The Register Request deferral keeps the line
+	 * quiet while it warms up, so there is nothing left for a re-commit to
+	 * fix: the ladder owns recovery now.
 	 */
-	if (!shot && en->tx_gate_enabled) {
-		if (en7572_tx_ready(en)) {
-			en->tx_recommit = 0;
-		} else if (en->tx_recommit < EN7572_TX_RECOMMIT_LIMIT) {
-			en->tx_recommit++;
+	if (en->tx_gate_enabled && !en7572_tx_ready(en)) {
+		if (!shot) {
 			en7572_log_analog(en, "tx-dark");
 			dev_warn(&en->program->dev,
-			         "TX path not ready %u ms after the gate opened, re-committing the calibration (%u of %u)\n",
-			         en7572_sample_ms[0], en->tx_recommit,
-			         EN7572_TX_RECOMMIT_LIMIT);
-			if (!en7572_tx_recommit(en))
-				return;	/* the recommit restarted sampling */
-		} else {
-			dev_err(&en->program->dev,
-			        "TX path still dark after %u calibration commits, leaving it to the xpon recovery ladder\n",
-			        EN7572_TX_RECOMMIT_LIMIT);
+			         "TX path not ready %u ms after the gate opened, waiting for the analog warm-up\n",
+			         en7572_sample_ms[0]);
 		}
+		if (shot == ARRAY_SIZE(en7572_sample_ms) - 1)
+			dev_err(&en->program->dev,
+			        "TX path still dark %u ms after the gate opened, leaving it to the xpon recovery ladder\n",
+			        en7572_sample_ms[0] + en7572_sample_ms[1] +
+			                en7572_sample_ms[2]);
 	}
 
 	en->sample_shot = shot + 1;
@@ -1152,7 +1142,6 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 			mod_delayed_work(system_wq, &en->ready_work, 0);
 			/* Sample the burst path while it is supposed to be alive. */
 			en->sample_shot = 0;
-			en->tx_recommit = 0;
 			mod_delayed_work(
 				system_wq, &en->sample_work,
 				msecs_to_jiffies(en7572_sample_ms[0]));
@@ -1193,35 +1182,6 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
 	return ret;
 }
 
-/*
- * Re-run the host half of the TX enable sequence on a path that is gated on
- * but reports no light: close the gate, rewrite the calibration and pulse
- * rg_loop_en, then open the gate again. Sampling restarts from the first
- * offset so the result is captured like any other enable.
- */
-static int en7572_tx_recommit(struct en7572 *en)
-{
-	unsigned int attempts = en->tx_recommit;
-	int ret;
-
-	ret = en7572_set_tx_enable(&en->frontend, false);
-	if (ret)
-		return ret;
-
-	/* Let the burst gate and the board TX_DISABLE pin settle first. */
-	usleep_range(5000, 6000);
-
-	ret = en7572_prepare(&en->frontend, en->prepared_mode);
-	if (ret)
-		return ret;
-
-	ret = en7572_set_tx_enable(&en->frontend, true);
-	/* The re-enable starts a new sample epoch but not a new retry budget. */
-	en->tx_recommit = attempts;
-
-	return ret;
-}
-
 static int en7572_reset(struct airoha_pon_frontend *frontend)
 {
 	struct en7572 *en = airoha_pon_frontend_priv(frontend);
@@ -1244,8 +1204,6 @@ static int en7572_reset(struct airoha_pon_frontend *frontend)
 	cancel_delayed_work(&en->ready_work);
 	if (en->tx_disable)
 		gpiod_set_value_cansleep(en->tx_disable, 1);
-	/* Do not let a stale readiness result span the firmware reload. */
-	en->tx_recommit = 0;
 	ret = en7572_start_md32(en, "recovery");
 	if (!ret)
 		ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG,

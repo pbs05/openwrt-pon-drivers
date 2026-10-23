@@ -123,11 +123,13 @@
 
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
 /*
- * Discovery Gates to skip while the optical TX path reports not ready. Bounded
- * so a permanently dark path still reaches the recovery ladder through the
- * normal MPCP timeout instead of stalling in discovery.
+ * Discovery Gates to skip while the optical TX path reports not ready. The
+ * analog path needs two to four seconds on this hardware, and one Gate per
+ * second, so six covers a full cold warm-up. Bounded so a permanently dark
+ * path still reaches the recovery ladder through the normal MPCP timeout
+ * instead of stalling in discovery.
  */
-#define AIROHA_EPON_TX_DEFER_LIMIT 3#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
+#define AIROHA_EPON_TX_DEFER_LIMIT 6#define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
 #define AIROHA_EPON_DISCOVERY_COMMAND        GENMASK(31, 30)
