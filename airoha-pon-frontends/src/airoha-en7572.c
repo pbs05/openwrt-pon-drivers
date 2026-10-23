@@ -638,15 +638,23 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 		return base;
 
 	/*
-	 * AdaptivePon() truncates erased bytes to each register's field width.
-	 * PON MAC retains control of burst timing with these default codes.
+	 * Stock firmware behavior: when the selected BOB calibration table is
+	 * unpopulated (all 0xFF), MD32 manages analog defaults internally.
+	 * Bypassing manual register overrides avoids writing 0xFF-truncated
+	 * extreme codes (e.g. max IMOD/IAV) into hardware registers.
 	 */
 	if ((base == EN7572_BOB_A0_BASE && !en->bob_a0_valid) ||
-	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid))
-		dev_warn(
+	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid)) {
+		dev_info(
 			&en->program->dev,
-			"preparing %s with an empty BOB table using stock-compatible register codes\n",
+			"BOB table for %s is empty; letting MD32 self-manage analog defaults\n",
 			en7572_mode_name(mode));
+		mutex_lock(&en->lock);
+		en->prepared_mode = mode;
+		en->prepared = true;
+		mutex_unlock(&en->lock);
+		return 0;
+	}
 
 	mutex_lock(&en->lock);
 	en->prepared = false;
