@@ -153,23 +153,6 @@ static bool en7572_bob_table_valid(const u8 *table)
 	return has_nonzero && has_non_ff;
 }
 
-static void en7572_apply_tx_ddmi_fallback(struct device *dev, struct en7572 *en)
-{
-	u8 *a0 = en->bob + EN7572_BOB_A0_BASE;
-	const u8 *a2 = en->bob + EN7572_BOB_A2_BASE;
-	u32 a0_tssi = get_unaligned_le32(a0 + EN7572_BOB_TSSI_CAL_1);
-	u32 a2_tssi = get_unaligned_le32(a2 + EN7572_BOB_TSSI_CAL_1);
-
-	/* Keep both wavelength profiles on the same TX DDMI code when A0 is empty. */
-	if (a0_tssi != U32_MAX)
-		return;
-
-	memcpy(a0 + EN7572_BOB_TSSI_CAL_1, a2 + EN7572_BOB_TSSI_CAL_1,
-	       sizeof(a0_tssi));
-	dev_warn(dev, "BOB A0 TX DDMI is erased; copied 4 bytes from A2%s\n",
-	         a2_tssi == U32_MAX ? " (A2 source is also erased)" : "");
-}
-
 /* EN7572 reads use a big-endian 16-bit subaddress and repeated start. */
 static int en7572_read(struct i2c_client *client, u16 reg, void *data,
                        size_t len)
@@ -408,16 +391,18 @@ validate:
 	en->bob_a0_valid = en7572_bob_table_valid(en->bob);
 	en->bob_a2_valid = en7572_bob_table_valid(en->bob + EN7572_BOB_A2_BASE);
 
-	if (!en->bob_a0_valid)
+	if (!en->bob_a0_valid && !en->bob_a2_valid)
 		dev_warn(
 			dev,
-			"BOB A0 calibration area is empty; XE/XES will use erased/default register codes\n");
-	if (!en->bob_a2_valid)
+			"no BOB profile is calibrated; every mode runs with erased/default register codes\n");
+	else if (!en->bob_a0_valid)
 		dev_warn(
 			dev,
-			"BOB A2 calibration area is empty; XG/XGS will use erased/default register codes\n");
-
-	en7572_apply_tx_ddmi_fallback(dev, en);
+			"BOB A0 profile is erased; every mode runs from the calibrated A2 profile\n");
+	else if (!en->bob_a2_valid)
+		dev_warn(
+			dev,
+			"BOB A2 profile is erased; every mode runs from the calibrated A0 profile\n");
 
 	dev_info(dev, "BOB %s: A0=%s A2=%s\n",
 	         loaded ? "loaded from NVMEM" : "using erased fallback",
@@ -602,6 +587,32 @@ static int en7572_bob_base(enum airoha_pon_frontend_mode mode)
 	}
 }
 
+/*
+ * Boards ship one calibrated profile, not two.
+ *
+ * The Nokia XG-040G-MD keeps the calibrated table in the A2 slot and leaves the
+ * A0 slot erased, but the 10G EPON modes select A0. Truncating the erased
+ * bytes to each register field yields all-ones analog codes: prepare() writes
+ * IAV_CAL=0x1fff and friends, the laser then runs far from its calibration
+ * (measured 107 mA bias instead of ~6 mA) and the MD32 reports a TX power word
+ * of 0x0001 (0.1 uW, -40.00 dBm) instead of the ~+3.7 dBm the module recorded
+ * in that same A2 table at the factory. A profile the board never calibrated
+ * cannot be run: prefer the slot that was calibrated, and keep the erased-code
+ * fallback only for boards with no calibration at all.
+ */
+static int en7572_calibrated_base(const struct en7572 *en,
+                                  enum airoha_pon_frontend_mode mode)
+{
+	int base = en7572_bob_base(mode);
+
+	if (base == EN7572_BOB_A0_BASE && !en->bob_a0_valid && en->bob_a2_valid)
+		return EN7572_BOB_A2_BASE;
+	if (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid && en->bob_a0_valid)
+		return EN7572_BOB_A0_BASE;
+
+	return base;
+}
+
 static const char *en7572_mode_name(enum airoha_pon_frontend_mode mode)
 {
 	switch (mode) {
@@ -633,7 +644,7 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	u32 tia;
 	int ret;
 
-	base = en7572_bob_base(mode);
+	base = en7572_calibrated_base(en, mode);
 	if (base < 0)
 		return base;
 
@@ -793,8 +804,8 @@ en7572_get_diagnostics(struct airoha_pon_frontend *frontend,
 		                     AIROHA_PON_FRONTEND_DIAG_TX_POWER |
 		                     AIROHA_PON_FRONTEND_DIAG_RX_POWER;
 		diagnostics->tx_gate_enabled = en->tx_gate_enabled;
-		bob_base = en->prepared ? en7572_bob_base(en->prepared_mode) :
-		                          -EINVAL;
+		bob_base = en->prepared ?
+			en7572_calibrated_base(en, en->prepared_mode) : -EINVAL;
 		if ((bob_base == EN7572_BOB_A0_BASE && en->bob_a0_valid) ||
 		    (bob_base == EN7572_BOB_A2_BASE && en->bob_a2_valid) ||
 		    (bob_base < 0 && en->bob_a0_valid && en->bob_a2_valid))
