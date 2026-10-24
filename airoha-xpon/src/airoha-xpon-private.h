@@ -9,6 +9,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pcs/pcs-airoha.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -164,6 +165,82 @@ struct airoha_xpon_stats {
 	unsigned int ploamu_blocked;
 };
 
+struct airoha_xpon_ranging_diagnostic {
+	u32 eqd;
+	u32 tx_sync_before;
+	u32 tx_sync_after;
+	u32 tx_sync_after_wait;
+	u32 fifo_before_ack;
+	u32 fifo_after_ack;
+	u32 ack_key_index;
+	u32 activation_reply_control;
+	u32 us_profile_valid_before_ack;
+	u32 us_profile_valid_at_deactivate;
+	u32 bwm_check_before_ack;
+	u32 bwm_check_after_ack;
+	u32 bwm_check_at_deactivate;
+	u32 tx_error_before_ack;
+	u32 tx_error_after_ack;
+	u32 tx_error_at_deactivate;
+	u32 ploamu_tx_before;
+	u32 ploamu_tx_after;
+	u32 ploamu_tx_at_deactivate;
+	u32 ack_tx_before;
+	u32 ack_tx_after;
+	u32 ack_tx_at_deactivate;
+	unsigned int tx_late_errors;
+	unsigned int tx_resyncs;
+	unsigned int tx_resync_failures;
+	unsigned int ploamu_blocked;
+	int ack_result;
+	int tx_sync_wait_result;
+	u8 flags;
+	bool absolute;
+	bool positive;
+	bool ack_attempted;
+	bool deactivated;
+	bool valid;
+};
+
+struct airoha_xpon_registration_diagnostic {
+	u32 key_index;
+	u32 fifo_before;
+	u32 fifo_after;
+	u32 ploamu_tx_before;
+	u32 ploamu_tx_after;
+	u32 ploamu_tx_at_deactivate;
+	unsigned int request_count;
+	unsigned int submit_successes;
+	unsigned int submit_failures;
+	unsigned int irq_before;
+	unsigned int irq_at_deactivate;
+	unsigned long request_jiffies;
+	unsigned int deactivate_ms;
+	int submit_result;
+	u8 seq;
+	u8 control_key_index;
+	bool pending;
+	bool deactivated;
+	bool valid;
+};
+
+struct airoha_xpon_alloc_id_diagnostic {
+	u32 fifo_before;
+	u32 fifo_after;
+	u32 ploamu_tx_before;
+	u32 ploamu_tx_after;
+	u32 ack_tx_before;
+	u32 ack_tx_after;
+	u16 alloc_id;
+	u16 onu_id;
+	int operation_result;
+	int ack_result;
+	u8 seq;
+	u8 type;
+	bool default_alloc_id;
+	bool valid;
+};
+
 struct airoha_xpon_identity_set {
 	/* ndo_open latches pending_identity into the active line epoch. */
 	struct airoha_xpon_identity default_identity;
@@ -184,6 +261,7 @@ struct airoha_xpon_crypto_state {
 	unsigned int key_report_tx_count;
 	unsigned int key_exchange_completed_count;
 	unsigned int key_exchange_error_count;
+	unsigned int key_switch_timeout_count;
 	enum airoha_xgpon_key_exchange_state exchange_state;
 	u8 data_keys[2][16];
 	u8 encrypted_data_key[16];
@@ -241,8 +319,13 @@ struct airoha_xpon {
 	struct airoha_xpon_data_path_state data_path;
 	struct airoha_xpon_epon epon;
 	struct airoha_xpon_stats stats;
+	struct airoha_xpon_ranging_diagnostic ranging_diagnostic;
+	struct airoha_xpon_registration_diagnostic registration_diagnostic;
+	struct airoha_xpon_alloc_id_diagnostic alloc_id_diagnostic;
 	struct mutex state_lock;
 	struct mutex ploam_lock;
+	/* Protects the activation diagnostic snapshots. */
+	spinlock_t ranging_diagnostic_lock;
 	struct work_struct start_work;
 	struct delayed_work link_work;
 	struct list_head netlink_node;
@@ -276,6 +359,10 @@ struct airoha_xpon {
 	bool service_ready;
 	bool stopping;
 	bool active_mode_valid;
+	bool bwmap_override_configured;
+	bool bwmap_stock_override;
+	bool bwmap_stock_applied;
+	u32 bwmap_inherited_control;
 };
 
 /*

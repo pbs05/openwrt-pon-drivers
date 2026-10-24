@@ -2,6 +2,7 @@
 #include <linux/airoha-eth.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
 #include <linux/unaligned.h>
@@ -32,6 +33,7 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 	u32 sync_state;
 	int ret;
 
+	lockdep_assert_held(&xpon->state_lock);
 	if (READ_ONCE(xpon->tx_armed))
 		return 0;
 	if (READ_ONCE(xpon->stopping) || !xpon->optical_signal ||
@@ -120,7 +122,7 @@ void airoha_xpon_clear_assignment(struct airoha_xpon *xpon)
 #define AIROHA_XGPON_PLOAMU_KEY_REPORT           0x05
 #define AIROHA_XGPON_PLOAMU_ACKNOWLEDGE          0x09
 #define AIROHA_XGPON_PLOAM_ACK_OK                0x00
-#define AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR     0x01
+#define AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR     0x05
 #define AIROHA_XGPON_KEY_CONTROL_GENERATE        0
 #define AIROHA_XGPON_KEY_CONTROL_CONFIRM         1
 #define AIROHA_XGPON_DATA_KEY_BYTES              16
@@ -627,20 +629,33 @@ static int airoha_xpon_send_ack(struct airoha_xpon *xpon, u8 seq,
                                 u8 completion_code)
 {
 	u8 message[AIROHA_XGPON_PLOAMU_BYTES] = {};
+	u32 key_index;
+	int ret;
 
 	/* Upstream PLOAM dest/msg/seq occupy bytes 4–7; downstream uses 0–3. */
+	key_index = airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+	message[3] = !!(key_index & AIROHA_XGPON_CUR_PIK_INDEX);
 	message[4] = xpon->onu_id >> 8;
 	message[5] = xpon->onu_id;
 	message[6] = AIROHA_XGPON_PLOAMU_ACKNOWLEDGE;
 	message[7] = seq;
 	message[8] = completion_code;
 
-	return airoha_xpon_send_ploamu(xpon, message);
+	ret = airoha_xpon_send_ploamu(xpon, message);
+	if (ret)
+		dev_warn_ratelimited(
+			xpon->dev,
+			"PLOAM ACK submission failed: seq=%u code=%u key-index=%u error=%d\n",
+			seq, completion_code, message[3], ret);
+	return ret;
 }
 
-static int airoha_xpon_send_registration(struct airoha_xpon *xpon, u8 seq)
+static int airoha_xpon_send_registration(
+	struct airoha_xpon *xpon, u8 seq,
+	struct airoha_xpon_registration_diagnostic *diagnostic)
 {
 	u8 message[AIROHA_XGPON_PLOAMU_BYTES] = {};
+	int ret;
 
 	message[4] = xpon->onu_id >> 8;
 	message[5] = xpon->onu_id;
@@ -650,7 +665,22 @@ static int airoha_xpon_send_registration(struct airoha_xpon *xpon, u8 seq)
 	memcpy(message + 8, xpon->identity.active_identity.registration_id,
 	       sizeof(xpon->identity.active_identity.registration_id));
 
-	return airoha_xpon_send_ploamu(xpon, message);
+	diagnostic->key_index =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+	diagnostic->control_key_index = message[3];
+	diagnostic->fifo_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic->ploamu_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic->irq_before =
+		READ_ONCE(xpon->stats.registration_sent_count);
+	ret = airoha_xpon_send_ploamu(xpon, message);
+	diagnostic->fifo_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic->ploamu_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+
+	return ret;
 }
 
 static int airoha_xpon_send_key_report(struct airoha_xpon *xpon, u8 seq,
@@ -919,20 +949,118 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	return 0;
 }
 
+static void airoha_xpon_save_ranging_diagnostic(
+	struct airoha_xpon *xpon,
+	struct airoha_xpon_ranging_diagnostic *diagnostic)
+{
+	unsigned long flags;
+
+	diagnostic->tx_late_errors =
+		READ_ONCE(xpon->stats.tx_late_error_count);
+	diagnostic->tx_resyncs = READ_ONCE(xpon->stats.tx_resync_count);
+	diagnostic->tx_resync_failures =
+		READ_ONCE(xpon->stats.tx_resync_failure_count);
+	diagnostic->ploamu_blocked = READ_ONCE(xpon->stats.ploamu_blocked);
+	diagnostic->valid = true;
+
+	spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+	xpon->ranging_diagnostic = *diagnostic;
+	spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+}
+
 static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
                                            const u8 *message)
 {
+	struct airoha_xpon_ranging_diagnostic diagnostic = {};
 	u16 dest = get_unaligned_be16(message);
 	u32 eqd = get_unaligned_be32(message + 5);
+	int ack_result;
+	int ret;
 	bool absolute = message[4] & BIT(0);
 	bool positive = !(message[4] & BIT(1));
 
 	if (xpon->onu_state == AIROHA_XGPON_O4) {
 		if (dest != xpon->onu_id || !absolute)
 			return -EINVAL;
+
+		diagnostic.eqd = eqd;
+		diagnostic.flags = message[4];
+		diagnostic.absolute = absolute;
+		diagnostic.positive = positive;
+		diagnostic.tx_sync_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
 		xpon->eqd = eqd;
 		airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, eqd);
+		diagnostic.tx_sync_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC);
+		/*
+		 * The vendor path enters O5 before checking TX timing readiness.
+		 * ACTIVATION_ST can change the upstream timing state, so an O4
+		 * ready sample does not prove that the first O5 grant is usable.
+		 */
 		airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O5);
+		ret = readl_poll_timeout(
+			xpon->xgpon_base + AIROHA_XGPON_DBG_RESYNC,
+			diagnostic.tx_sync_after_wait,
+			diagnostic.tx_sync_after_wait &
+				AIROHA_XGPON_TX_SYNC_READY,
+			10, 3000);
+		diagnostic.tx_sync_wait_result = ret;
+		if (ret) {
+			diagnostic.fifo_before_ack = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+			airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
+			dev_warn(
+				xpon->dev,
+				"PLOAM ranging diagnostic: flags=0x%02x "
+				"absolute=%u positive=%u EqD=0x%08x "
+				"TX_SYNC_READY=%u->%u->%u wait=%d "
+				"ACK=not-attempted PLOAMu_FIFO=0x%08x; "
+				"entered O5 without ACK\n",
+				diagnostic.flags, diagnostic.absolute,
+				diagnostic.positive, diagnostic.eqd,
+				!!(diagnostic.tx_sync_before &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				!!(diagnostic.tx_sync_after &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				!!(diagnostic.tx_sync_after_wait &
+				   AIROHA_XGPON_TX_SYNC_READY),
+				ret, diagnostic.fifo_before_ack);
+			return ret;
+		}
+
+		diagnostic.fifo_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		diagnostic.ack_key_index =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX);
+		diagnostic.activation_reply_control = airoha_xgpon_read(
+			xpon, AIROHA_XGPON_O23_O4_PLOAMU_CTRL);
+		diagnostic.us_profile_valid_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_US_PROF_VLD);
+		diagnostic.bwm_check_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+		diagnostic.tx_error_before_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
+		diagnostic.ploamu_tx_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+		diagnostic.ack_tx_before =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+		/* Submit before link notifications can delay the first O5 grant. */
+		ack_result = airoha_xpon_send_ack(
+			xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
+		diagnostic.ack_attempted = true;
+		diagnostic.ack_result = ack_result;
+		diagnostic.fifo_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+		diagnostic.ploamu_tx_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+		diagnostic.ack_tx_after =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+		diagnostic.bwm_check_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+		diagnostic.tx_error_after_ack =
+			airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
+		airoha_xpon_save_ranging_diagnostic(xpon, &diagnostic);
 		/* O5 marks line activation; service_ready tracks usable service GEMs. */
 		xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
 		airoha_xpon_update_omci_link(xpon);
@@ -940,12 +1068,28 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xpon_set_data_path_link(xpon, true);
 		dev_info(
 			xpon->dev,
-			"PLOAM: absolute EqD=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
-			eqd);
-		/* Record the O-state even when a closed TX gate blocks its ACK. */
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_OK);
-		return 0;
+			"PLOAM ranging diagnostic: flags=0x%02x absolute=%u "
+			"positive=%u EqD=0x%08x TX_SYNC_READY=%u->%u->%u "
+			"wait=%d ACK=%d PLOAMu_TX=%u->%u ACK_TX=%u->%u "
+			"PLOAMu_FIFO=0x%08x->0x%08x tx_late=%u tx_resync=%u "
+			"tx_resync_failed=%u blocked=%u; entered O5; "
+			"service GEM/T-CONT mapping is still required\n",
+			diagnostic.flags, diagnostic.absolute,
+			diagnostic.positive, diagnostic.eqd,
+			!!(diagnostic.tx_sync_before &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			!!(diagnostic.tx_sync_after &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			!!(diagnostic.tx_sync_after_wait &
+			   AIROHA_XGPON_TX_SYNC_READY),
+			diagnostic.tx_sync_wait_result,
+			diagnostic.ack_result, diagnostic.ploamu_tx_before,
+			diagnostic.ploamu_tx_after, diagnostic.ack_tx_before,
+			diagnostic.ack_tx_after, diagnostic.fifo_before_ack,
+			diagnostic.fifo_after_ack, diagnostic.tx_late_errors,
+			diagnostic.tx_resyncs, diagnostic.tx_resync_failures,
+			diagnostic.ploamu_blocked);
+		return ack_result;
 	}
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 ||
@@ -960,39 +1104,80 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 		xpon->eqd -= min(eqd, xpon->eqd);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, xpon->eqd);
 
+	if (dest == xpon->onu_id)
+		return airoha_xpon_send_ack(xpon, message[3],
+		                            AIROHA_XGPON_PLOAM_ACK_OK);
+
 	return 0;
 }
 
 static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
                                        const u8 *message)
 {
+	struct airoha_xpon_alloc_id_diagnostic diagnostic = {};
+	unsigned long flags;
 	u16 dest = get_unaligned_be16(message);
 	u16 alloc_id = (message[4] & 0x3f) << 8 | message[5];
 	u8 type = message[6];
 	u8 index;
-	int ret;
+	int ret, ack_result;
 
-	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id ||
-	    alloc_id == xpon->onu_id)
+	if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id)
 		return -EINVAL;
 
-	if (type == 1)
+	diagnostic.seq = message[3];
+	diagnostic.alloc_id = alloc_id;
+	diagnostic.onu_id = xpon->onu_id;
+	diagnostic.type = type;
+	diagnostic.default_alloc_id = alloc_id == xpon->onu_id;
+	diagnostic.fifo_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic.ploamu_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic.ack_tx_before =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+
+	/*
+	 * T-CONT 0 shadows ONU-ID. The vendor path acknowledges this default
+	 * Alloc-ID without trying to create a second table entry.
+	 */
+	if (alloc_id == xpon->onu_id)
+		ret = 0;
+	else if (type == 1)
 		ret = airoha_xpon_find_or_create_tcont(xpon, alloc_id, &index);
 	else if (type == 0xff)
 		ret = airoha_xpon_remove_tcont(xpon, alloc_id);
 	else
 		ret = -EINVAL;
 
-	if (ret)
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR);
-	else
-		airoha_xpon_send_ack(xpon, message[3],
-		                     AIROHA_XGPON_PLOAM_ACK_OK);
-	/* drain holds only ploam_lock; link_work applies under state_lock. */
+	ack_result = airoha_xpon_send_ack(
+		xpon, message[3], ret ? AIROHA_XGPON_PLOAM_ACK_PROCESS_ERROR :
+		                       AIROHA_XGPON_PLOAM_ACK_OK);
+	diagnostic.operation_result = ret;
+	diagnostic.ack_result = ack_result;
+	diagnostic.fifo_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_PLOAMU_FIFO_STS);
+	diagnostic.ploamu_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+	diagnostic.ack_tx_after =
+		airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+	diagnostic.valid = true;
+	spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+	xpon->alloc_id_diagnostic = diagnostic;
+	spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+	dev_info_ratelimited(
+		xpon->dev,
+		"PLOAM Alloc-ID diagnostic: seq=%u alloc_id=%u onu_id=%u type=0x%02x default=%u operation=%d ACK=%d PLOAMu_FIFO=0x%08x->0x%08x PLOAMu_TX=%u->%u ACK_TX=%u->%u\n",
+		diagnostic.seq, diagnostic.alloc_id, diagnostic.onu_id,
+		diagnostic.type, diagnostic.default_alloc_id,
+		diagnostic.operation_result, diagnostic.ack_result,
+		diagnostic.fifo_before, diagnostic.fifo_after,
+		diagnostic.ploamu_tx_before, diagnostic.ploamu_tx_after,
+		diagnostic.ack_tx_before, diagnostic.ack_tx_after);
+	/* link_work applies pending mappings after the FIFO lock is released. */
 	if (!ret && type == 1 && READ_ONCE(xpon->data_path.pending_count))
 		atomic_set(&xpon->data_path_retry_pending, 1);
-	return ret;
+	return ret ?: ack_result;
 }
 
 static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
@@ -1010,6 +1195,10 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		if (dest != AIROHA_XGPON_BROADCAST_ID && dest != xpon->onu_id)
 			return -EADDRNOTAVAIL;
 		ret = airoha_xpon_program_profile(xpon, message);
+		if (!ret && xpon->onu_state == AIROHA_XGPON_O5 &&
+		    dest == xpon->onu_id)
+			ret = airoha_xpon_send_ack(
+				xpon, message[3], AIROHA_XGPON_PLOAM_ACK_OK);
 		break;
 	case AIROHA_XGPON_PLOAMD_ASSIGN_ONU_ID:
 		ret = airoha_xpon_accept_assign_onu_id(xpon, message);
@@ -1023,8 +1212,43 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 	case AIROHA_XGPON_PLOAMD_REQUEST_REGISTRATION:
 		if (xpon->onu_state != AIROHA_XGPON_O5 || dest != xpon->onu_id)
 			ret = -EINVAL;
-		else
-			ret = airoha_xpon_send_registration(xpon, message[3]);
+		else {
+			struct airoha_xpon_registration_diagnostic registration;
+			unsigned long flags;
+
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			registration = xpon->registration_diagnostic;
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                       flags);
+			registration.request_count++;
+			registration.seq = message[3];
+			registration.request_jiffies = jiffies;
+			registration.pending = true;
+			registration.deactivated = false;
+			registration.valid = true;
+			ret = airoha_xpon_send_registration(
+				xpon, message[3], &registration);
+			registration.submit_result = ret;
+			if (ret)
+				registration.submit_failures++;
+			else
+				registration.submit_successes++;
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			xpon->registration_diagnostic = registration;
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                       flags);
+			dev_info_ratelimited(
+				xpon->dev,
+				"PLOAM registration diagnostic: seq=%u key_index=0x%08x control_key_index=%u submit=%d PLOAMu_FIFO=0x%08x->0x%08x PLOAMu_TX=%u->%u registration_irq=%u\n",
+				registration.seq, registration.key_index,
+				registration.control_key_index,
+				registration.submit_result,
+				registration.fifo_before,
+				registration.fifo_after,
+				registration.ploamu_tx_before,
+				registration.ploamu_tx_after,
+				registration.irq_before);
+		}
 		if (ret == -EACCES)
 			ret = 0;
 		break;
@@ -1036,6 +1260,67 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		    dest != AIROHA_XGPON_ALL_ONU_ID)
 			ret = -EINVAL;
 		else {
+			struct airoha_xpon_registration_diagnostic registration = {};
+			u32 ack_tx_at_deactivate;
+			u32 bwm_check_at_deactivate;
+			u32 ploamu_tx_at_deactivate;
+			u32 tx_error_at_deactivate;
+			u32 us_profile_valid_at_deactivate;
+			unsigned long flags;
+
+			ploamu_tx_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_TX_PLOAMU_CNT);
+			ack_tx_at_deactivate = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_TX_ACK_PLOAMU_CNT);
+			us_profile_valid_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_US_PROF_VLD);
+			bwm_check_at_deactivate = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+			tx_error_at_deactivate =
+				airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS);
+			spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+			if (xpon->ranging_diagnostic.valid &&
+			    xpon->onu_state == AIROHA_XGPON_O5) {
+				xpon->ranging_diagnostic.ack_tx_at_deactivate =
+					ack_tx_at_deactivate;
+				xpon->ranging_diagnostic.ploamu_tx_at_deactivate =
+					ploamu_tx_at_deactivate;
+				xpon->ranging_diagnostic
+					.us_profile_valid_at_deactivate =
+					us_profile_valid_at_deactivate;
+				xpon->ranging_diagnostic.bwm_check_at_deactivate =
+					bwm_check_at_deactivate;
+				xpon->ranging_diagnostic.tx_error_at_deactivate =
+					tx_error_at_deactivate;
+				xpon->ranging_diagnostic.deactivated = true;
+			}
+			if (xpon->registration_diagnostic.valid &&
+			    xpon->registration_diagnostic.pending &&
+			    xpon->onu_state == AIROHA_XGPON_O5) {
+				xpon->registration_diagnostic
+					.ploamu_tx_at_deactivate =
+					ploamu_tx_at_deactivate;
+				xpon->registration_diagnostic.irq_at_deactivate =
+					READ_ONCE(
+						xpon->stats.registration_sent_count);
+				xpon->registration_diagnostic.deactivate_ms =
+					jiffies_to_msecs(
+						jiffies -
+						xpon->registration_diagnostic
+							.request_jiffies);
+				xpon->registration_diagnostic.pending = false;
+				xpon->registration_diagnostic.deactivated = true;
+				registration = xpon->registration_diagnostic;
+			}
+			spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock,
+			                        flags);
+			if (registration.deactivated)
+				dev_info_ratelimited(
+					xpon->dev,
+					"PLOAM registration diagnostic: Deactivate after %u ms PLOAMu_TX=%u registration_irq=%u\n",
+					registration.deactivate_ms,
+					registration.ploamu_tx_at_deactivate,
+					registration.irq_at_deactivate);
 			/* PLAIN_RESET preserves PHY sync; link_work resets the MAC after
 			 * releasing ploam_lock.
 			 */
@@ -1059,7 +1344,7 @@ unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon)
 {
 	unsigned int count;
 
-	/* T-CONT/GEM share a command port with manual data-path updates. */
+	lockdep_assert_held(&xpon->state_lock);
 	mutex_lock(&xpon->ploam_lock);
 	for (count = 0; count < AIROHA_XGPON_PLOAMD_MAX_DRAIN; count++) {
 		u8 message[AIROHA_XGPON_PLOAMD_BYTES];

@@ -496,13 +496,27 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "fifo_error: 0x%08x\n"
 		           "tx_error: 0x%08x\n"
 		           "rx_error: 0x%08x\n"
-		           "mbi_mpi_stop: 0x%08x\n",
+		           "bwmap_check_control: 0x%08x\n"
+		           "bwmap_check_status: 0x%08x\n"
+		           "mbi_mpi_stop: 0x%08x\n"
+		           "eqd: 0x%08x\n"
+		           "tx_sync_ready: %u\n"
+		           "ploamu_fifo_status: 0x%08x\n",
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_STATUS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_ENABLE),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS),
-		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP));
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_DBG_BWM_CHK_CTRL),
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_DBG_BWM_CHK_STS),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_EQD),
+		           !!(airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC) &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           airoha_xgpon_read(xpon,
+		                             AIROHA_XGPON_PLOAMU_FIFO_STS));
 	}
 out:
 	mutex_unlock(&xpon->state_lock);
@@ -525,11 +539,13 @@ static int pon_crypto_debug_show(struct seq_file *m, void *unused)
 		           "activation_keys_programmed: %d\n"
 		           "key_exchange_state: %u\n"
 		           "key_exchange_errors: %u\n"
+		           "key_switch_timeouts: %u\n"
 		           "current_key_index: 0x%08x\n",
 		           xpon->crypto.default_ploam_ik_programmed,
 		           xpon->crypto.activation_keys_programmed,
 		           xpon->crypto.exchange_state,
 		           xpon->crypto.key_exchange_error_count,
+		           xpon->crypto.key_switch_timeout_count,
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_CUR_KIDX));
 	mutex_unlock(&xpon->state_lock);
 	return 0;
@@ -582,6 +598,10 @@ DEFINE_SHOW_ATTRIBUTE(pon_datapath_debug);
 static int pon_registration_debug_show(struct seq_file *m, void *unused)
 {
 	struct airoha_xpon *xpon = m->private;
+	struct airoha_xpon_ranging_diagnostic ranging = {};
+	struct airoha_xpon_registration_diagnostic registration = {};
+	struct airoha_xpon_alloc_id_diagnostic alloc_id = {};
+	unsigned long flags;
 	bool epon;
 
 	mutex_lock(&xpon->state_lock);
@@ -636,8 +656,156 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 		           xpon->identity.active_identity.serial_configured,
 		           xpon->identity.active_identity
 		                   .registration_id_configured,
-		           xpon->stats.ploamd_accepted,
-		           xpon->stats.ploamd_rejected);
+		           READ_ONCE(xpon->stats.ploamd_accepted),
+		           READ_ONCE(xpon->stats.ploamd_rejected));
+		seq_printf(m,
+		           "ranging_requests: %u\n"
+		           "registrations_sent: %u\n"
+		           "tx_late_errors: %u\n"
+		           "tx_resyncs: %u\n"
+		           "tx_resync_failures: %u\n"
+		           "ploamu_blocked: %u\n",
+		           READ_ONCE(xpon->stats.ranging_request_count),
+		           READ_ONCE(xpon->stats.registration_sent_count),
+		           READ_ONCE(xpon->stats.tx_late_error_count),
+		           READ_ONCE(xpon->stats.tx_resync_count),
+		           READ_ONCE(xpon->stats.tx_resync_failure_count),
+		           READ_ONCE(xpon->stats.ploamu_blocked));
+		spin_lock_irqsave(&xpon->ranging_diagnostic_lock, flags);
+		ranging = xpon->ranging_diagnostic;
+		registration = xpon->registration_diagnostic;
+		alloc_id = xpon->alloc_id_diagnostic;
+		spin_unlock_irqrestore(&xpon->ranging_diagnostic_lock, flags);
+		seq_printf(m,
+		           "ranging_diagnostic_valid: %u\n"
+		           "ranging_flags: 0x%02x\n"
+		           "ranging_absolute: %u\n"
+		           "ranging_positive: %u\n"
+		           "ranging_eqd: 0x%08x\n"
+		           "ranging_tx_sync_before: %u\n"
+		           "ranging_tx_sync_after: %u\n"
+		           "ranging_tx_sync_after_wait: %u\n"
+		           "ranging_tx_sync_wait_result: %d\n"
+		           "ranging_ack_attempted: %u\n"
+		           "ranging_ack_result: %d\n"
+		           "ranging_ack_key_index: 0x%08x\n"
+		           "ranging_activation_reply_control: 0x%08x\n"
+		           "ranging_us_profile_valid_before_ack: 0x%08x\n"
+		           "ranging_us_profile_valid_at_deactivate: 0x%08x\n"
+		           "ranging_bwmap_status_before_ack: 0x%08x\n"
+		           "ranging_bwmap_status_after_ack: 0x%08x\n"
+		           "ranging_bwmap_status_at_deactivate: 0x%08x\n"
+		           "ranging_tx_error_before_ack: 0x%08x\n"
+		           "ranging_tx_error_after_ack: 0x%08x\n"
+		           "ranging_tx_error_at_deactivate: 0x%08x\n"
+		           "ranging_ploamu_tx_before: %u\n"
+		           "ranging_ploamu_tx_after: %u\n"
+		           "ranging_ploamu_tx_at_deactivate: %u\n"
+		           "ranging_ack_tx_before: %u\n"
+		           "ranging_ack_tx_after: %u\n"
+		           "ranging_deactivated: %u\n"
+		           "ranging_ack_tx_at_deactivate: %u\n"
+		           "ranging_ploamu_fifo_before_ack: 0x%08x\n"
+		           "ranging_ploamu_fifo_after_ack: 0x%08x\n"
+		           "ranging_tx_late_errors: %u\n"
+		           "ranging_tx_resyncs: %u\n"
+		           "ranging_tx_resync_failures: %u\n"
+		           "ranging_ploamu_blocked: %u\n",
+		           ranging.valid, ranging.flags, ranging.absolute,
+		           ranging.positive, ranging.eqd,
+		           !!(ranging.tx_sync_before &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           !!(ranging.tx_sync_after &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           !!(ranging.tx_sync_after_wait &
+		              AIROHA_XGPON_TX_SYNC_READY),
+		           ranging.tx_sync_wait_result,
+		           ranging.ack_attempted,
+		           ranging.ack_result, ranging.ack_key_index,
+		           ranging.activation_reply_control,
+		           ranging.us_profile_valid_before_ack,
+		           ranging.us_profile_valid_at_deactivate,
+		           ranging.bwm_check_before_ack,
+		           ranging.bwm_check_after_ack,
+		           ranging.bwm_check_at_deactivate,
+		           ranging.tx_error_before_ack,
+		           ranging.tx_error_after_ack,
+		           ranging.tx_error_at_deactivate,
+		           ranging.ploamu_tx_before, ranging.ploamu_tx_after,
+		           ranging.ploamu_tx_at_deactivate,
+		           ranging.ack_tx_before, ranging.ack_tx_after,
+		           ranging.deactivated,
+		           ranging.ack_tx_at_deactivate, ranging.fifo_before_ack,
+		           ranging.fifo_after_ack, ranging.tx_late_errors,
+		           ranging.tx_resyncs, ranging.tx_resync_failures,
+		           ranging.ploamu_blocked);
+		seq_printf(
+			m,
+			"registration_diagnostic_valid: %u\n"
+			"registration_requests: %u\n"
+			"registration_submit_successes: %u\n"
+			"registration_submit_failures: %u\n"
+			"registration_seq: %u\n"
+			"registration_key_index: 0x%08x\n"
+			"registration_control_key_index: %u\n"
+			"registration_submit_result: %d\n"
+			"registration_fifo_before: 0x%08x\n"
+			"registration_fifo_before_overrun: %u\n"
+			"registration_fifo_before_avail: %u\n"
+			"registration_fifo_after: 0x%08x\n"
+			"registration_fifo_after_overrun: %u\n"
+			"registration_fifo_after_avail: %u\n"
+			"registration_ploamu_tx_before: %u\n"
+			"registration_ploamu_tx_after: %u\n"
+			"registration_irq_before: %u\n"
+			"registration_pending: %u\n"
+			"registration_deactivated: %u\n"
+			"registration_deactivate_ms: %u\n"
+			"registration_ploamu_tx_at_deactivate: %u\n"
+			"registration_irq_at_deactivate: %u\n",
+			registration.valid, registration.request_count,
+			registration.submit_successes,
+			registration.submit_failures, registration.seq,
+			registration.key_index, registration.control_key_index,
+			registration.submit_result, registration.fifo_before,
+			!!(registration.fifo_before &
+			   AIROHA_XGPON_PLOAMU_FIFO_OVERRUN),
+			FIELD_GET(AIROHA_XGPON_PLOAMU_FIFO_AVAIL_MASK,
+			          registration.fifo_before),
+			registration.fifo_after,
+			!!(registration.fifo_after &
+			   AIROHA_XGPON_PLOAMU_FIFO_OVERRUN),
+			FIELD_GET(AIROHA_XGPON_PLOAMU_FIFO_AVAIL_MASK,
+			          registration.fifo_after),
+			registration.ploamu_tx_before,
+			registration.ploamu_tx_after, registration.irq_before,
+			registration.pending, registration.deactivated,
+			registration.deactivate_ms,
+			registration.ploamu_tx_at_deactivate,
+			registration.irq_at_deactivate);
+		seq_printf(
+			m,
+			"alloc_id_diagnostic_valid: %u\n"
+			"alloc_id_seq: %u\n"
+			"alloc_id_value: %u\n"
+			"alloc_id_onu_id: %u\n"
+			"alloc_id_type: 0x%02x\n"
+			"alloc_id_default: %u\n"
+			"alloc_id_operation_result: %d\n"
+			"alloc_id_ack_result: %d\n"
+			"alloc_id_fifo_before: 0x%08x\n"
+			"alloc_id_fifo_after: 0x%08x\n"
+			"alloc_id_ploamu_tx_before: %u\n"
+			"alloc_id_ploamu_tx_after: %u\n"
+			"alloc_id_ack_tx_before: %u\n"
+			"alloc_id_ack_tx_after: %u\n",
+			alloc_id.valid, alloc_id.seq, alloc_id.alloc_id,
+			alloc_id.onu_id, alloc_id.type,
+			alloc_id.default_alloc_id, alloc_id.operation_result,
+			alloc_id.ack_result, alloc_id.fifo_before,
+			alloc_id.fifo_after, alloc_id.ploamu_tx_before,
+			alloc_id.ploamu_tx_after, alloc_id.ack_tx_before,
+			alloc_id.ack_tx_after);
 	}
 	mutex_unlock(&xpon->state_lock);
 	return 0;

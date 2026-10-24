@@ -40,6 +40,15 @@
 #define EN7572_LOOP_CTRL        0x0208
 #define EN7572_DCL_CTRL_2       0x0210
 
+#define EN7572_DCL_IMOD_MASK GENMASK(27, 16)
+#define EN7572_DCL_IAV_MASK  GENMASK(12, 0)
+#define EN7572_ERC_DAC_MASK  GENMASK(27, 16)
+#define EN7572_TIA_CFG_MASK  GENMASK(13, 8)
+#define EN7572_TIA_GAIN_MASK GENMASK(2, 0)
+#define EN7572_TIA_BW_MASK   GENMASK(5, 3)
+#define EN7572_PGA_GAIN_MASK GENMASK(18, 16)
+#define EN7572_PGA_CAP_MASK  GENMASK(6, 5)
+
 #define EN7572_MD32_PM_CFG  0x3000
 #define EN7572_MD32_PM_ADDR 0x3004
 #define EN7572_MD32_PM_DATA 0x3008
@@ -123,6 +132,7 @@ struct en7572 {
 	bool prepared;
 	enum airoha_pon_frontend_mode prepared_mode;
 	bool tx_gate_enabled;
+	bool md32_needs_reload;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -137,7 +147,7 @@ static u16 en7572_bob_u16(struct en7572 *en, unsigned int base,
 	return get_unaligned_le16(en->bob + base + offset);
 }
 
-static bool en7572_bob_table_valid(const u8 *table)
+static bool en7572_bob_table_populated(const u8 *table)
 {
 	bool has_nonzero = false;
 	bool has_non_ff = false;
@@ -151,6 +161,30 @@ static bool en7572_bob_table_valid(const u8 *table)
 	}
 
 	return has_nonzero && has_non_ff;
+}
+
+static int en7572_validate_bob_table(struct device *dev, const u8 *table,
+                                    const char *name)
+{
+	if (!en7572_bob_table_populated(table))
+		return 0;
+
+	if (!FIELD_FIT(EN7572_DCL_IMOD_MASK,
+	               get_unaligned_le16(table + EN7572_BOB_IMOD_CAL)) ||
+	    !FIELD_FIT(EN7572_DCL_IAV_MASK,
+	               get_unaligned_le16(table + EN7572_BOB_IAV_CAL)) ||
+	    !FIELD_FIT(EN7572_ERC_DAC_MASK,
+	               get_unaligned_le16(table + EN7572_BOB_ERC_DAC)) ||
+	    !FIELD_FIT(EN7572_TIA_GAIN_MASK, table[EN7572_BOB_TIA_GAIN]) ||
+	    !FIELD_FIT(EN7572_TIA_BW_MASK, table[EN7572_BOB_TIA_BW]) ||
+	    !FIELD_FIT(EN7572_PGA_GAIN_MASK, table[EN7572_BOB_PGA_GAIN]) ||
+	    !FIELD_FIT(EN7572_PGA_CAP_MASK, table[EN7572_BOB_PGA_CAP]))
+		return dev_err_probe(
+			dev, -EINVAL,
+			"BOB %s has out-of-range analog calibration; refusing to initialize MD32\n",
+			name);
+
+	return 0;
 }
 
 static void en7572_apply_tx_ddmi_fallback(struct device *dev, struct en7572 *en)
@@ -405,17 +439,25 @@ static int en7572_load_bob(struct device *dev, struct en7572 *en)
 	loaded = true;
 
 validate:
-	en->bob_a0_valid = en7572_bob_table_valid(en->bob);
-	en->bob_a2_valid = en7572_bob_table_valid(en->bob + EN7572_BOB_A2_BASE);
+	ret = en7572_validate_bob_table(dev, en->bob, "A0");
+	if (ret)
+		return ret;
+	ret = en7572_validate_bob_table(dev, en->bob + EN7572_BOB_A2_BASE, "A2");
+	if (ret)
+		return ret;
+
+	en->bob_a0_valid = en7572_bob_table_populated(en->bob);
+	en->bob_a2_valid =
+		en7572_bob_table_populated(en->bob + EN7572_BOB_A2_BASE);
 
 	if (!en->bob_a0_valid)
 		dev_warn(
 			dev,
-			"BOB A0 calibration area is empty; XE/XES will use erased/default register codes\n");
+			"BOB A0 calibration area is empty; XE/XES will use MD32 analog defaults\n");
 	if (!en->bob_a2_valid)
 		dev_warn(
 			dev,
-			"BOB A2 calibration area is empty; XG/XGS will use erased/default register codes\n");
+			"BOB A2 calibration area is empty; XG/XGS will use MD32 analog defaults\n");
 
 	en7572_apply_tx_ddmi_fallback(dev, en);
 
@@ -637,36 +679,53 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	if (base < 0)
 		return base;
 
-	/*
-	 * AdaptivePon() truncates erased bytes to each register's field width.
-	 * PON MAC retains control of burst timing with these default codes.
-	 */
-	if ((base == EN7572_BOB_A0_BASE && !en->bob_a0_valid) ||
-	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid))
-		dev_warn(
-			&en->program->dev,
-			"preparing %s with an empty BOB table using stock-compatible register codes\n",
-			en7572_mode_name(mode));
-
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
+	if (en->tx_disable)
+		gpiod_set_value_cansleep(en->tx_disable, 1);
 
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
 	                         EN7572_BEN_MODE_OFF);
 	if (ret)
 		goto out_unlock;
 
+	/* Probe supplies the first fresh image; subsequent starts discard APC state. */
+	if (en->md32_needs_reload) {
+		ret = en7572_initialize_md32(en);
+		if (ret) {
+			dev_err(&en->program->dev,
+			        "MD32 reload failed: %d; burst TX remains disabled\n",
+			        ret);
+			goto out_unlock;
+		}
+	}
+	en->md32_needs_reload = true;
+
+	/*
+	 * When the selected BOB table is empty, MD32 manages analog defaults
+	 * internally. Avoid writing erased bytes as extreme register values.
+	 */
+	if ((base == EN7572_BOB_A0_BASE && !en->bob_a0_valid) ||
+	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid)) {
+		dev_info(
+			&en->program->dev,
+			"BOB table for %s is empty; letting MD32 self-manage analog defaults\n",
+			en7572_mode_name(mode));
+		ret = 0;
+		goto out_prepared;
+	}
+
 	ret = en7572_update_bits(
-		en, EN7572_DCL_CTRL_2, GENMASK(27, 16),
-		FIELD_PREP(GENMASK(27, 16),
+		en, EN7572_DCL_CTRL_2, EN7572_DCL_IMOD_MASK,
+		FIELD_PREP(EN7572_DCL_IMOD_MASK,
 	                   en7572_bob_u16(en, base, EN7572_BOB_IMOD_CAL)));
 	if (ret)
 		goto out_unlock;
 
 	ret = en7572_update_bits(
-		en, EN7572_DCL_CTRL_2, GENMASK(12, 0),
-		FIELD_PREP(GENMASK(12, 0),
+		en, EN7572_DCL_CTRL_2, EN7572_DCL_IAV_MASK,
+		FIELD_PREP(EN7572_DCL_IAV_MASK,
 	                   en7572_bob_u16(en, base, EN7572_BOB_IAV_CAL)));
 	if (ret)
 		goto out_unlock;
@@ -692,29 +751,31 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 		goto out_unlock;
 
 	ret = en7572_update_bits(
-		en, EN7572_IMPD_SINK, GENMASK(27, 16),
-		FIELD_PREP(GENMASK(27, 16),
+		en, EN7572_IMPD_SINK, EN7572_ERC_DAC_MASK,
+		FIELD_PREP(EN7572_ERC_DAC_MASK,
 	                   en7572_bob_u16(en, base, EN7572_BOB_ERC_DAC)));
 	if (ret)
 		goto out_unlock;
 
-	tia = (en7572_bob_u8(en, base, EN7572_BOB_TIA_BW) << 3) |
-	      en7572_bob_u8(en, base, EN7572_BOB_TIA_GAIN);
-	ret = en7572_update_bits(en, EN7572_RESERVE_TIA, GENMASK(13, 8),
-	                         FIELD_PREP(GENMASK(13, 8), tia));
+	tia = FIELD_PREP(EN7572_TIA_BW_MASK,
+	                 en7572_bob_u8(en, base, EN7572_BOB_TIA_BW)) |
+	      FIELD_PREP(EN7572_TIA_GAIN_MASK,
+	                 en7572_bob_u8(en, base, EN7572_BOB_TIA_GAIN));
+	ret = en7572_update_bits(en, EN7572_RESERVE_TIA, EN7572_TIA_CFG_MASK,
+	                         FIELD_PREP(EN7572_TIA_CFG_MASK, tia));
 	if (ret)
 		goto out_unlock;
 
 	ret = en7572_update_bits(
-		en, EN7572_REP_PH_CAP_SEL, GENMASK(18, 16),
-		FIELD_PREP(GENMASK(18, 16),
+		en, EN7572_REP_PH_CAP_SEL, EN7572_PGA_GAIN_MASK,
+		FIELD_PREP(EN7572_PGA_GAIN_MASK,
 	                   en7572_bob_u8(en, base, EN7572_BOB_PGA_GAIN)));
 	if (ret)
 		goto out_unlock;
 
 	ret = en7572_update_bits(
-		en, EN7572_REP_PH_CAP_SEL, GENMASK(6, 5),
-		FIELD_PREP(GENMASK(6, 5),
+		en, EN7572_REP_PH_CAP_SEL, EN7572_PGA_CAP_MASK,
+		FIELD_PREP(EN7572_PGA_CAP_MASK,
 	                   en7572_bob_u8(en, base, EN7572_BOB_PGA_CAP)));
 	if (ret)
 		goto out_unlock;
@@ -728,6 +789,7 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	ret = en7572_update_bits(en, EN7572_LOOP_CTRL, BIT(0), 0);
 	if (!ret)
 		ret = en7572_update_bits(en, EN7572_LOOP_CTRL, BIT(0), BIT(0));
+out_prepared:
 	if (!ret) {
 		en->prepared_mode = mode;
 		en->prepared = true;
@@ -834,10 +896,11 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 	struct en7572 *en = airoha_pon_frontend_priv(frontend);
 	int ret;
 
-	if (enable && !en->prepared)
-		return -EAGAIN;
-
 	mutex_lock(&en->lock);
+	if (enable && !en->prepared) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
 	if (enable) {
 		/* Enter burst mode before releasing the board TX_DISABLE gate. */
 		ret = en7572_update_bits(en, EN7572_BEN_CTRL,
@@ -857,6 +920,7 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 		                         EN7572_BEN_MODE_MASK,
 		                         EN7572_BEN_MODE_OFF);
 	}
+out_unlock:
 	mutex_unlock(&en->lock);
 
 	return ret;
@@ -962,6 +1026,13 @@ static int en7572_probe(struct i2c_client *client)
 	ret = en7572_load_blob(dev, EN7572_FW_DM_NAME, en->dm, EN7572_DM_SIZE);
 	if (ret)
 		return ret;
+
+	/* Rejecting calibration must leave BEN closed even without a board GPIO. */
+	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
+	                         EN7572_BEN_MODE_OFF);
+	if (ret)
+		return dev_err_probe(dev, ret,
+		                     "failed to close BEN before loading calibration\n");
 
 	ret = en7572_load_bob(dev, en);
 	if (ret)

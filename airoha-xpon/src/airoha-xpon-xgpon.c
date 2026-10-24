@@ -4,11 +4,18 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/module.h>
 #include <linux/workqueue.h>
 
 #include "airoha-xpon-private.h"
+#include "airoha-xpon-epon.h"
 #include "airoha-xpon-omci.h"
 #include "airoha-xpon-xgpon.h"
+
+static bool xgpon_stock_bwmap;
+module_param(xgpon_stock_bwmap, bool, 0400);
+MODULE_PARM_DESC(xgpon_stock_bwmap,
+                 "Default stock XG-PON BWmap policy; per-device sysfs may override it (default: preserve)");
 
 static void airoha_xpon_xgpon_release_mac_interfaces(struct airoha_xpon *xpon)
 {
@@ -232,12 +239,23 @@ irqreturn_t airoha_xpon_xgpon_phy_irq(struct airoha_xpon *xpon)
 	if (events & AIROHA_XGPON_PHY_INT_RX_LOF)
 		xpon->stats.phy_lof_count++;
 
-	if (events &
-	    (AIROHA_XGPON_PHY_INT_RX_LOS | AIROHA_XGPON_PHY_INT_RX_RDY))
-		mod_delayed_work(system_wq, &xpon->link_work, 0);
-	else
-		queue_delayed_work(system_wq, &xpon->link_work, 0);
+	mod_delayed_work(system_wq, &xpon->link_work, 0);
 	return IRQ_HANDLED;
+}
+
+void airoha_xpon_xgpon_drain_ploamd_locked(struct airoha_xpon *xpon)
+{
+	lockdep_assert_held(&xpon->state_lock);
+	if (xpon->stopping || !xpon->active_mode_valid ||
+	    !xpon->mac_initialized ||
+	    airoha_xpon_mode_is_epon(xpon->active_mode))
+		return;
+
+	if (airoha_xpon_drain_ploamd(xpon) == AIROHA_XGPON_PLOAMD_MAX_DRAIN) {
+		dev_warn_ratelimited(
+			xpon->dev, "PLOAMd FIFO drain reached the safety limit\n");
+		mod_delayed_work(system_wq, &xpon->link_work, 0);
+	}
 }
 
 irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
@@ -311,11 +329,15 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 		}
 	}
 
-	if ((events & AIROHA_XGPON_INT_PLOAMD_RECV) &&
-	    airoha_xpon_drain_ploamd(xpon) == AIROHA_XGPON_PLOAMD_MAX_DRAIN)
-		dev_warn_ratelimited(
-			xpon->dev,
-			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
+	if (events & AIROHA_XGPON_INT_PLOAMD_RECV) {
+		/* Recovery synchronizes this IRQ while holding state_lock. */
+		if (mutex_trylock(&xpon->state_lock)) {
+			airoha_xpon_xgpon_drain_ploamd_locked(xpon);
+			mutex_unlock(&xpon->state_lock);
+		} else {
+			mod_delayed_work(system_wq, &xpon->link_work, 0);
+		}
+	}
 	if (atomic_read(&xpon->mac_restart_pending) ||
 	    atomic_read(&xpon->data_path_retry_pending))
 		mod_delayed_work(system_wq, &xpon->link_work, 0);
@@ -404,6 +426,11 @@ airoha_xpon_xgpon_reset_and_enable_digital_rx(struct airoha_xpon *xpon)
 
 static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 {
+	bool stock_bwmap = xpon->bwmap_override_configured ?
+		                   xpon->bwmap_stock_override :
+		                   xgpon_stock_bwmap;
+
+	lockdep_assert_held(&xpon->state_lock);
 	if (READ_ONCE(xpon->stopping))
 		return -ESHUTDOWN;
 
@@ -415,6 +442,19 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	airoha_xpon_xgpon_counters_start(xpon);
 	airoha_xpon_xgpon_release_mac_interfaces(xpon);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_US_PROF_VLD, 0);
+	/* Save the inherited policy so disabling the override is reversible. */
+	if (stock_bwmap) {
+		if (!xpon->bwmap_stock_applied)
+			xpon->bwmap_inherited_control = airoha_xgpon_read(
+				xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL);
+		airoha_xgpon_write(xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL,
+		                   AIROHA_XGPON_BWM_CHK_CTRL_STOCK);
+		xpon->bwmap_stock_applied = true;
+	} else if (xpon->bwmap_stock_applied) {
+		airoha_xgpon_write(xpon, AIROHA_XGPON_DBG_BWM_CHK_CTRL,
+		                   xpon->bwmap_inherited_control);
+		xpon->bwmap_stock_applied = false;
+	}
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_RSP_TIME,
 	                         AIROHA_XGPON_RESPONSE_TIME_MASK, 0x551);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_O23_O4_PLOAMU_CTRL,
@@ -441,6 +481,7 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	xpon->crypto.key_report_tx_count = 0;
 	xpon->crypto.key_exchange_completed_count = 0;
 	xpon->crypto.key_exchange_error_count = 0;
+	xpon->crypto.key_switch_timeout_count = 0;
 	airoha_xpon_clear_assignment(xpon);
 	airoha_xpon_clear_tconts(xpon);
 	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O2_3);
