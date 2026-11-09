@@ -444,6 +444,41 @@ static void airoha_xpon_epon_send_deregister(struct airoha_xpon *xpon)
 	airoha_epon_write(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL, command);
 }
 
+/*
+ * Open the frontend TX gate for a MAC start. A recovery whose prepare() failed
+ * (an I2C error during stage 1, or the prepare() after a stage 2 reload) leaves
+ * the frontend unprepared, and set_tx_enable() then refuses with -EAGAIN. The
+ * recovery has already dropped its request and stays idle while TX is not
+ * armed, so without a prepare() here every later MAC start would stop at the
+ * same -EAGAIN and the line would stay dark. Prepare the frontend again and
+ * retry once; if the bus is still failing, this start fails and link_work tries
+ * again on the next pass.
+ */
+static int airoha_xpon_epon_arm_tx(struct airoha_xpon *xpon)
+{
+	const struct airoha_xpon_mode_info *mode;
+	int ret;
+
+	ret = airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+	if (ret != -EAGAIN)
+		return ret;
+
+	mode = airoha_xpon_mode_info(xpon->active_mode);
+	if (!mode)
+		return -EOPNOTSUPP;
+
+	dev_warn(xpon->dev,
+	         "optical frontend is not prepared; preparing it again before arming TX\n");
+	ret = airoha_pon_frontend_prepare(xpon->frontend, mode->frontend_mode);
+	if (ret) {
+		dev_err(xpon->dev,
+		        "re-preparing the optical frontend failed: %d\n", ret);
+		return ret;
+	}
+
+	return airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+}
+
 static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 {
 	u32 tx_cal;
@@ -525,7 +560,7 @@ static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 	xpon->epon.channel = 0;
 	airoha_xpon_epon_reset_registration(xpon);
 	/* MPCP grants control BEN while the MAC is in burst mode. */
-	ret = airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+	ret = airoha_xpon_epon_arm_tx(xpon);
 	if (ret)
 		return ret;
 	xpon->tx_armed = true;
