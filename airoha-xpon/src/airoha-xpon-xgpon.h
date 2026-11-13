@@ -14,6 +14,7 @@ void airoha_xpon_xgpon_mask_irqs(struct airoha_xpon *xpon);
 bool airoha_xpon_xgpon_los(struct airoha_xpon *xpon);
 irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon);
 irqreturn_t airoha_xpon_xgpon_phy_irq(struct airoha_xpon *xpon);
+void airoha_xpon_xgpon_drain_ploamd_locked(struct airoha_xpon *xpon);
 void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon,
                                    const char *reason);
 void airoha_xpon_xgpon_advance(struct airoha_xpon *xpon, u32 phy_events,

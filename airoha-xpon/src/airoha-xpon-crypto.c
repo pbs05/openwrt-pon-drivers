@@ -381,9 +381,16 @@ int airoha_xpon_activate_data_key(struct airoha_xpon *xpon, u8 index)
 	ret = readl_poll_timeout_atomic(
 		xpon->xgpon_base + AIROHA_XGPON_INT_STATUS, status,
 		status & AIROHA_XGPON_INT_AES_KEY_SWITCH_DONE, 1, 3000);
-	if (!ret)
-		airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
-		                   AIROHA_XGPON_INT_AES_KEY_SWITCH_DONE);
+	if (ret) {
+		xpon->crypto.key_switch_timeout_count++;
+		dev_warn_ratelimited(
+			xpon->dev,
+			"AES key switch to slot %u not acknowledged (status=0x%08x); continuing confirm, hardware completion is unverified\n",
+			(unsigned int)index, status);
+		return 0;
+	}
+	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
+	                   AIROHA_XGPON_INT_AES_KEY_SWITCH_DONE);
 	return 0;
 }
 
