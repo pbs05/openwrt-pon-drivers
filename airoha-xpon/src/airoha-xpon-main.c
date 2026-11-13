@@ -449,6 +449,15 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	}
 	airoha_xpon_leds_update(xpon);
 
+	/*
+	 * An armed EPON MAC that keeps missing grants has a wedged burst path:
+	 * the optics answers on I2C while the fibre carries no light. Reloading
+	 * the provider firmware from link_work restarts the line itself.
+	 */
+	if (airoha_xpon_mode_is_epon(xpon->active_mode) &&
+	    airoha_xpon_epon_recover_tx(xpon))
+		goto out_requeue;
+
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
 		airoha_xpon_xgpon_drain_ploamd_locked(xpon);

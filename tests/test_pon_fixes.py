@@ -111,6 +111,8 @@ class Branches:
             return self.locals[node.name] if node.name in self.locals else self.constant(node.name)
         if isinstance(node, C.StructRef):
             return self.eval(node.name)[node.field.name]
+        if isinstance(node, C.ArrayRef):
+            return self.eval(node.name)[self.eval(node.subscript)]
         if isinstance(node, C.Cast):
             return self.eval(node.expr)
         if isinstance(node, C.TernaryOp):
@@ -207,7 +209,7 @@ class PonFixTests(unittest.TestCase):
             en = {"lock": 0, "prepared": False, "tx_gate_enabled": False,
                   "tx_disable": 1, "md32_needs_reload": False, "bob_a0_valid": not empty,
                   "bob_a2_valid": not empty, "program": {"dev": 0}, "bob": 0,
-                  "runtime": 0}
+                  "runtime": 0, "tx_ready_state": True, "ready_work": 0}
             reload_error = [0]
             vm = Branches({
                 "airoha_pon_frontend_priv": lambda frontend: en,
@@ -215,12 +217,15 @@ class PonFixTests(unittest.TestCase):
                 "mutex_lock": lambda *a: events.append("lock"),
                 "mutex_unlock": lambda *a: events.append("unlock"),
                 "gpiod_set_value_cansleep": lambda gpio, value: events.append(("gpio", value)),
+                "WRITE_ONCE": lambda *a: None,
+                "cancel_delayed_work": lambda *a: None,
                 "en7572_update_bits": lambda *a: events.append("register") or 0,
                 "en7572_initialize_md32": lambda *a: events.append("reload") or reload_error[0],
                 "en7572_mode_name": lambda *a: "XG-PON",
                 "en7572_bob_u8": lambda *a: 0,
                 "en7572_bob_u16": lambda *a: 0,
                 "en7572_write": lambda *a: 0,
+                "en7572_log_state": lambda *a: None,
                 "dev_info": lambda *a: None,
                 "dev_err": lambda *a: events.append("error"),
                 "GENMASK": lambda high, low: ((1 << (high - low + 1)) - 1) << low,
@@ -250,7 +255,12 @@ class PonFixTests(unittest.TestCase):
         self.assertEqual(worker.count("airoha_xpon_xgpon_drain_ploamd_locked(xpon)"), 2)
         self.assertEqual(worker.count('airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate")'), 2)
         enable = function("en7572_set_tx_enable")
-        self.assertLess(enable.index("mutex_lock"), enable.index("!en->prepared"))
+        prepared_guards = [
+            match.start() for match in re.finditer(r"if \(enable && !en->prepared\)", enable)
+        ]
+        self.assertEqual(len(prepared_guards), 2)
+        self.assertLess(prepared_guards[0], enable.index("mutex_lock"))
+        self.assertGreater(prepared_guards[1], enable.index("mutex_lock"))
         self.assertNotIn("queue_delayed_work(", function("airoha_xpon_xgpon_phy_irq"))
         self.assertIn("mod_delayed_work(", function("airoha_xpon_xgpon_phy_irq"))
         registration = function("airoha_xpon_send_registration")
@@ -303,22 +313,31 @@ class PonFixTests(unittest.TestCase):
                 for gate_error in (0, -5):
                     events = []
                     en = {"lock": 0, "prepared": prepared,
-                          "tx_gate_enabled": False, "tx_disable": 1}
+                          "tx_gate_enabled": False, "tx_disable": 1,
+                          "tx_ready_state": False, "ready_work": 0,
+                          "sample_work": 0}
                     vm = Branches({
                         "airoha_pon_frontend_priv": lambda frontend: en,
                         "mutex_lock": lambda *a: events.append("lock"),
                         "mutex_unlock": lambda *a: events.append("unlock"),
+                        "WRITE_ONCE": lambda *a: None,
+                        "cancel_delayed_work": lambda *a: None,
+                        "mod_delayed_work": lambda *a: None,
+                        "msecs_to_jiffies": lambda delay: delay,
                         "en7572_update_bits": lambda *a: events.append("register") or gate_error,
                         "gpiod_set_value_cansleep": lambda gpio, value: events.append(("gpio", value)),
                         "GENMASK": lambda high, low: ((1 << (high - low + 1)) - 1) << low,
                         "FIELD_PREP": lambda mask, value: value * (mask & -mask),
                     })
-                    ret = vm.run("en7572_set_tx_enable", frontend=0, enable=enable)
-                    self.assertEqual(events[0], "lock")
-                    self.assertEqual(events[-1], "unlock")
+                    ret = vm.run(
+                        "en7572_set_tx_enable", frontend=0, enable=enable,
+                        jiffies=123, system_wq=0, en7572_sample_ms=[1],
+                    )
                     if enable and not prepared:
-                        self.assertEqual((ret, events), (-errno.EAGAIN, ["lock", "unlock"]))
+                        self.assertEqual((ret, events), (-errno.EAGAIN, []))
                     else:
+                        self.assertEqual(events[0], "lock")
+                        self.assertEqual(events[-1], "unlock")
                         self.assertEqual(ret, gate_error)
                     self.assertEqual(en["tx_gate_enabled"], enable and prepared and not gate_error)
                     if enable and prepared and not gate_error:
