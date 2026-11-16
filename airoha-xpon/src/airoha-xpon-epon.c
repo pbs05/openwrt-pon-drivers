@@ -444,16 +444,7 @@ static void airoha_xpon_epon_send_deregister(struct airoha_xpon *xpon)
 	airoha_epon_write(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL, command);
 }
 
-/*
- * Open the frontend TX gate for a MAC start. A recovery whose prepare() failed
- * (an I2C error during stage 1, or the prepare() after a stage 2 reload) leaves
- * the frontend unprepared, and set_tx_enable() then refuses with -EAGAIN. The
- * recovery has already dropped its request and stays idle while TX is not
- * armed, so without a prepare() here every later MAC start would stop at the
- * same -EAGAIN and the line would stay dark. Prepare the frontend again and
- * retry once; if the bus is still failing, this start fails and link_work tries
- * again on the next pass.
- */
+/* A transient recovery error can leave the frontend unprepared for MAC restart. */
 static int airoha_xpon_epon_arm_tx(struct airoha_xpon *xpon)
 {
 	const struct airoha_xpon_mode_info *mode;
@@ -468,7 +459,7 @@ static int airoha_xpon_epon_arm_tx(struct airoha_xpon *xpon)
 		return -EOPNOTSUPP;
 
 	dev_warn(xpon->dev,
-	         "optical frontend is not prepared; preparing it again before arming TX\n");
+	         "preparing optical frontend before EPON TX restart\n");
 	ret = airoha_pon_frontend_prepare(xpon->frontend, mode->frontend_mode);
 	if (ret) {
 		dev_err(xpon->dev,
