@@ -444,6 +444,32 @@ static void airoha_xpon_epon_send_deregister(struct airoha_xpon *xpon)
 	airoha_epon_write(xpon, AIROHA_EPON_LLID_DISCOVERY_CTRL, command);
 }
 
+/* A transient recovery error can leave the frontend unprepared for MAC restart. */
+static int airoha_xpon_epon_arm_tx(struct airoha_xpon *xpon)
+{
+	const struct airoha_xpon_mode_info *mode;
+	int ret;
+
+	ret = airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+	if (ret != -EAGAIN)
+		return ret;
+
+	mode = airoha_xpon_mode_info(xpon->active_mode);
+	if (!mode)
+		return -EOPNOTSUPP;
+
+	dev_warn(xpon->dev,
+	         "preparing optical frontend before EPON TX restart\n");
+	ret = airoha_pon_frontend_prepare(xpon->frontend, mode->frontend_mode);
+	if (ret) {
+		dev_err(xpon->dev,
+		        "re-preparing the optical frontend failed: %d\n", ret);
+		return ret;
+	}
+
+	return airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+}
+
 static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 {
 	u32 tx_cal;
@@ -525,7 +551,7 @@ static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 	xpon->epon.channel = 0;
 	airoha_xpon_epon_reset_registration(xpon);
 	/* MPCP grants control BEN while the MAC is in burst mode. */
-	ret = airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
+	ret = airoha_xpon_epon_arm_tx(xpon);
 	if (ret)
 		return ret;
 	xpon->tx_armed = true;
