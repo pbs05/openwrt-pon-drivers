@@ -139,6 +139,47 @@ static ssize_t registration_id_store(struct device *dev,
 static DEVICE_ATTR(registration_id, 0600, registration_id_show,
                    registration_id_store);
 
+static ssize_t xgpon_stock_bwmap_show(struct device *dev,
+                                     struct device_attribute *attr, char *buf)
+{
+	struct airoha_xpon *xpon = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	mutex_lock(&xpon->state_lock);
+	if (xpon->bwmap_override_configured)
+		ret = sysfs_emit(buf, "%d\n", xpon->bwmap_stock_override);
+	else
+		ret = sysfs_emit(buf, "default\n");
+	mutex_unlock(&xpon->state_lock);
+
+	return ret;
+}
+
+static ssize_t xgpon_stock_bwmap_store(struct device *dev,
+                                      struct device_attribute *attr,
+                                      const char *buf, size_t count)
+{
+	struct airoha_xpon *xpon = dev_get_drvdata(dev);
+	bool use_default = sysfs_streq(buf, "default");
+	bool stock = false;
+	int ret;
+
+	if (!use_default) {
+		ret = kstrtobool(buf, &stock);
+		if (ret)
+			return ret;
+	}
+
+	/* Stage the policy; never alter grant filtering on a live MAC here. */
+	mutex_lock(&xpon->state_lock);
+	xpon->bwmap_override_configured = !use_default;
+	xpon->bwmap_stock_override = stock;
+	mutex_unlock(&xpon->state_lock);
+
+	return count;
+}
+static DEVICE_ATTR_RW(xgpon_stock_bwmap);
+
 static ssize_t active_serial_number_show(struct device *dev,
                                          struct device_attribute *attr,
                                          char *buf)
@@ -339,6 +380,7 @@ static struct attribute *airoha_xpon_attrs[] = {
 	&dev_attr_serial_number.attr,
 	&dev_attr_active_serial_number.attr,
 	&dev_attr_registration_id.attr,
+	&dev_attr_xgpon_stock_bwmap.attr,
 	&dev_attr_omci_msk.attr,
 	&dev_attr_data_path.attr,
 	&dev_attr_service_ready.attr,
