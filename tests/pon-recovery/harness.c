@@ -32,6 +32,7 @@ static int en7572_update_bits(struct en7572 *en, u16 reg, u32 mask, u32 value)
     (void)mask; (void)value;
     return en7572_write(en->runtime, reg, NULL, 4);
 }
+static int en7572_initialize_md32(struct en7572 *en) { (void)en; return 0; }
 static void en7572_log_state(struct en7572 *en, const char *tag) { (void)en; (void)tag; }
 static const unsigned int en7572_sample_ms[] = {2000, 2000, 4000};
 static struct en7572 EN;
