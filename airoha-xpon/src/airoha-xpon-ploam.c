@@ -4,6 +4,7 @@
 #include <linux/iopoll.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
+#include <linux/overflow.h>
 #include <linux/unaligned.h>
 
 #include "airoha-xpon-omci.h"
@@ -507,20 +508,29 @@ out_state:
 	return ret;
 }
 
+/* G.9807.1 Table C.11.4: rate bit 1 selects the 9.95328 Gb/s ONU. */
+static int airoha_xpon_profile_repeat(bool xgspon, u8 control, u8 repeat)
+{
+	if (!!(control & BIT(2)) != xgspon)
+		return -EINVAL;
+
+	return xgspon ? repeat : repeat & GENMASK(4, 0);
+}
+
 static int airoha_xpon_program_profile(struct airoha_xpon *xpon,
                                        const u8 *message)
 {
 	u8 index = message[4] & 0x03;
-	u8 line_rate = (message[4] >> 2) & 0x01;
 	u8 version = message[4] >> 4;
 	u8 delimiter_len = message[6] & 0x0f;
 	u8 preamble_len = message[15] & 0x0f;
-	u8 repeat = message[16] & 0x1f;
 	u32 length, psbu, valid_reg, length_reg, pon_tag0, pon_tag1;
 	u32 preamble_reg, delimiter_reg;
-	int ret;
+	int repeat, ret;
 
-	if (line_rate || delimiter_len > 8 || preamble_len > 8)
+	repeat = airoha_xpon_profile_repeat(
+		xpon->active_mode == AIROHA_XPON_MODE_XGSPON, message[4], message[16]);
+	if (repeat < 0 || delimiter_len > 8 || preamble_len > 8)
 		return -EINVAL;
 
 	length = preamble_len * repeat + delimiter_len;
@@ -859,6 +869,13 @@ error:
 	return ret;
 }
 
+static bool airoha_xpon_is_broadcast(struct airoha_xpon *xpon, u16 dest)
+{
+	return dest == AIROHA_XGPON_BROADCAST_ID ||
+	       (xpon->active_mode == AIROHA_XPON_MODE_XGSPON &&
+	        dest == AIROHA_XGPON_ALL_ONU_ID);
+}
+
 static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
                                             const u8 *message)
 {
@@ -866,7 +883,7 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	u16 onu_id = (message[4] & 0x03) << 8 | message[5];
 	int ret;
 
-	if (dest != AIROHA_XGPON_BROADCAST_ID) {
+	if (!airoha_xpon_is_broadcast(xpon, dest)) {
 		dev_dbg(xpon->dev, "Assign ONU-ID rejected: destination=%u\n",
 		        dest);
 		return -EINVAL;
@@ -919,13 +936,33 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	return 0;
 }
 
+/*
+ * The OLT reports delay in nominal 2.48832 Gb/s bit periods.
+ * The MAC's EQD register uses upstream lane bit periods.
+ */
+static int airoha_xpon_eqd_register_value(bool xgspon, u32 delay, u32 *value)
+{
+	if (xgspon && delay > U32_MAX / 4)
+		return -ERANGE;
+
+	*value = xgspon ? delay * 4 : delay;
+	return 0;
+}
+
 static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
                                            const u8 *message)
 {
 	u16 dest = get_unaligned_be16(message);
-	u32 eqd = get_unaligned_be32(message + 5);
 	bool absolute = message[4] & BIT(0);
 	bool positive = !(message[4] & BIT(1));
+	u32 eqd, adjusted;
+	int ret;
+
+	ret = airoha_xpon_eqd_register_value(
+		xpon->active_mode == AIROHA_XPON_MODE_XGSPON,
+		get_unaligned_be32(message + 5), &eqd);
+	if (ret)
+		return ret;
 
 	if (xpon->onu_state == AIROHA_XGPON_O4) {
 		if (dest != xpon->onu_id || !absolute)
@@ -940,7 +977,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xpon_set_data_path_link(xpon, true);
 		dev_info(
 			xpon->dev,
-			"PLOAM: absolute EqD=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
+			"PLOAM: absolute EqD register=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
 			eqd);
 		/* Record the O-state even when a closed TX gate blocks its ACK. */
 		airoha_xpon_send_ack(xpon, message[3],
@@ -949,15 +986,18 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 	}
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 ||
-	    (dest != xpon->onu_id && dest != AIROHA_XGPON_BROADCAST_ID))
+	    (dest != xpon->onu_id && !airoha_xpon_is_broadcast(xpon, dest)))
 		return -EINVAL;
 
 	if (absolute)
 		xpon->eqd = eqd;
-	else if (positive)
-		xpon->eqd += eqd;
-	else
+	else if (positive) {
+		if (check_add_overflow(xpon->eqd, eqd, &adjusted))
+			return -ERANGE;
+		xpon->eqd = adjusted;
+	} else {
 		xpon->eqd -= min(eqd, xpon->eqd);
+	}
 	airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, xpon->eqd);
 
 	return 0;
@@ -1007,7 +1047,7 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 
 	switch (message[2]) {
 	case AIROHA_XGPON_PLOAMD_PROFILE:
-		if (dest != AIROHA_XGPON_BROADCAST_ID && dest != xpon->onu_id)
+		if (dest != xpon->onu_id && !airoha_xpon_is_broadcast(xpon, dest))
 			return -EADDRNOTAVAIL;
 		ret = airoha_xpon_program_profile(xpon, message);
 		break;
