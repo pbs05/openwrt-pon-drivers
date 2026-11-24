@@ -4,6 +4,7 @@
 #include <linux/iopoll.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
+#include <linux/overflow.h>
 #include <linux/unaligned.h>
 
 #include "airoha-xpon-omci.h"
@@ -935,13 +936,33 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	return 0;
 }
 
+/*
+ * The OLT reports delay in nominal 2.48832 Gb/s bit periods.
+ * The MAC's EQD register uses upstream lane bit periods.
+ */
+static int airoha_xpon_eqd_register_value(bool xgspon, u32 delay, u32 *value)
+{
+	if (xgspon && delay > U32_MAX / 4)
+		return -ERANGE;
+
+	*value = xgspon ? delay * 4 : delay;
+	return 0;
+}
+
 static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
                                            const u8 *message)
 {
 	u16 dest = get_unaligned_be16(message);
-	u32 eqd = get_unaligned_be32(message + 5);
 	bool absolute = message[4] & BIT(0);
 	bool positive = !(message[4] & BIT(1));
+	u32 eqd, adjusted;
+	int ret;
+
+	ret = airoha_xpon_eqd_register_value(
+		xpon->active_mode == AIROHA_XPON_MODE_XGSPON,
+		get_unaligned_be32(message + 5), &eqd);
+	if (ret)
+		return ret;
 
 	if (xpon->onu_state == AIROHA_XGPON_O4) {
 		if (dest != xpon->onu_id || !absolute)
@@ -956,7 +977,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 			airoha_xpon_set_data_path_link(xpon, true);
 		dev_info(
 			xpon->dev,
-			"PLOAM: absolute EqD=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
+			"PLOAM: absolute EqD register=0x%08x; entered O5; service GEM/T-CONT mapping is still required\n",
 			eqd);
 		/* Record the O-state even when a closed TX gate blocks its ACK. */
 		airoha_xpon_send_ack(xpon, message[3],
@@ -970,10 +991,13 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 
 	if (absolute)
 		xpon->eqd = eqd;
-	else if (positive)
-		xpon->eqd += eqd;
-	else
+	else if (positive) {
+		if (check_add_overflow(xpon->eqd, eqd, &adjusted))
+			return -ERANGE;
+		xpon->eqd = adjusted;
+	} else {
 		xpon->eqd -= min(eqd, xpon->eqd);
+	}
 	airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, xpon->eqd);
 
 	return 0;

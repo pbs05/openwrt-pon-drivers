@@ -103,7 +103,7 @@ static int airoha_xpon_xgpon_resync_tx_locked(struct airoha_xpon *xpon)
 	if (ret)
 		goto out_restore;
 
-	/* Software resync uses the current OLT EqD when DBG_RESYNC is submitted. */
+	/* Replay the cached hardware EqD without applying the mode scale again. */
 	airoha_xgpon_write(xpon, AIROHA_XGPON_EQD, xpon->eqd);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_DBG_RESYNC,
 	                         AIROHA_XGPON_SW_RESYNC_MASK,

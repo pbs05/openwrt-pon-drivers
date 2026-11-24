@@ -294,7 +294,7 @@ struct airoha_xpon {
 	atomic_t data_path_retry_pending;
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
-	u32 eqd;
+	u32 eqd; /* Cached hardware register value, including mode scaling. */
 	bool optical_signal;
 	/* The PCS profile identifies retained PMA calibration and line rate. */
 	enum airoha_pcs_pon_mode pcs_profile;
