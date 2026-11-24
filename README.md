@@ -22,7 +22,7 @@ Work in progress. APIs may change substantially.
 | --- | --- |
 | GPON | ❌ |
 | XG-PON | ✅️ |
-| XGS-PON | ❓ |
+| XGS-PON | ✅️ |
 | EPON 1G/1G | ❌ |
 | 10G-EPON 10G/1G | ✅️ |
 | 10G-EPON 10G/10G | ❓ |
