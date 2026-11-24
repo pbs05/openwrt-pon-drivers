@@ -507,20 +507,29 @@ out_state:
 	return ret;
 }
 
+/* G.9807.1 Table C.11.4: rate bit 1 selects the 9.95328 Gb/s ONU. */
+static int airoha_xpon_profile_repeat(bool xgspon, u8 control, u8 repeat)
+{
+	if (!!(control & BIT(2)) != xgspon)
+		return -EINVAL;
+
+	return xgspon ? repeat : repeat & GENMASK(4, 0);
+}
+
 static int airoha_xpon_program_profile(struct airoha_xpon *xpon,
                                        const u8 *message)
 {
 	u8 index = message[4] & 0x03;
-	u8 line_rate = (message[4] >> 2) & 0x01;
 	u8 version = message[4] >> 4;
 	u8 delimiter_len = message[6] & 0x0f;
 	u8 preamble_len = message[15] & 0x0f;
-	u8 repeat = message[16] & 0x1f;
 	u32 length, psbu, valid_reg, length_reg, pon_tag0, pon_tag1;
 	u32 preamble_reg, delimiter_reg;
-	int ret;
+	int repeat, ret;
 
-	if (line_rate || delimiter_len > 8 || preamble_len > 8)
+	repeat = airoha_xpon_profile_repeat(
+		xpon->active_mode == AIROHA_XPON_MODE_XGSPON, message[4], message[16]);
+	if (repeat < 0 || delimiter_len > 8 || preamble_len > 8)
 		return -EINVAL;
 
 	length = preamble_len * repeat + delimiter_len;
