@@ -868,6 +868,13 @@ error:
 	return ret;
 }
 
+static bool airoha_xpon_is_broadcast(struct airoha_xpon *xpon, u16 dest)
+{
+	return dest == AIROHA_XGPON_BROADCAST_ID ||
+	       (xpon->active_mode == AIROHA_XPON_MODE_XGSPON &&
+	        dest == AIROHA_XGPON_ALL_ONU_ID);
+}
+
 static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
                                             const u8 *message)
 {
@@ -875,7 +882,7 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	u16 onu_id = (message[4] & 0x03) << 8 | message[5];
 	int ret;
 
-	if (dest != AIROHA_XGPON_BROADCAST_ID) {
+	if (!airoha_xpon_is_broadcast(xpon, dest)) {
 		dev_dbg(xpon->dev, "Assign ONU-ID rejected: destination=%u\n",
 		        dest);
 		return -EINVAL;
@@ -958,7 +965,7 @@ static int airoha_xpon_accept_ranging_time(struct airoha_xpon *xpon,
 	}
 
 	if (xpon->onu_state != AIROHA_XGPON_O5 ||
-	    (dest != xpon->onu_id && dest != AIROHA_XGPON_BROADCAST_ID))
+	    (dest != xpon->onu_id && !airoha_xpon_is_broadcast(xpon, dest)))
 		return -EINVAL;
 
 	if (absolute)
@@ -1016,7 +1023,7 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 
 	switch (message[2]) {
 	case AIROHA_XGPON_PLOAMD_PROFILE:
-		if (dest != AIROHA_XGPON_BROADCAST_ID && dest != xpon->onu_id)
+		if (dest != xpon->onu_id && !airoha_xpon_is_broadcast(xpon, dest))
 			return -EADDRNOTAVAIL;
 		ret = airoha_xpon_program_profile(xpon, message);
 		break;
